@@ -18,7 +18,7 @@ Public_DIR = "C:\City Experience\Public Data Base"
 			
 		b. Per Vendor COGS分析。在vendor级别数据的基础上操作
 			i. 纵向Per Vendor COGS分析。新增列Coordinator per Pax，Food per Pax，Guide per Pax，Headsets per Pax，Misc per Pax，Tickets per Pax，Transport per Pax， COGS per Pax。 使用对应的列除以Actual Pax得到。我需要统计出来各个Event, Event ID的High Season和Low Season的不同年度各个成本项目的Per Pax的变化,如能够显示各个Event 和Event ID的High Season以及Low Season的2025年Coordinator per Pax，2024年Coordinator per Pax，以及2025年比2024年的Coordinator per Pax变化的%，并且突出显示（颜色）成本项目per Pax上涨幅度大的。统计方式是每个项目单独的一个表格，按照变化的%降序排列。
-			ii. 横向Per Vendor COGS分析。按照Vendor，Season，Year聚合Coordinator，Food，Guide，Headsets，Misc，Tickets，Transport，Actual Pax列，使用sum聚合。新增列Coordinator per Pax，Food per Pax，Guide per Pax，Headsets per Pax，Misc per Pax，Tickets per Pax，Transport per Pax， 使用对应的列除以Actual Pax得到。需要统计出来同一Year同一Season各个成本项目 的不同Vendor的值，如2025年High Season的成本项目Guide per Pax的不同Vendor值分别是多少，并且将其中最大的和最小的通过不同颜色突出显示。
+			ii. 横向Per Vendor COGS分析。按照Vendor，Season，Year聚合Coordinator，Food，Guide，Headsets，Misc，Tickets，Transport，COGS, Actual Pax列，使用sum聚合。新增列Coordinator per Pax，Food per Pax，Guide per Pax，Headsets per Pax，Misc per Pax，Tickets per Pax，Transport per Pax，COGS per Pax 使用对应的列除以Actual Pax得到。需要统计出来同一Year同一Season各个成本项目 的不同Vendor的值，如2025年High Season的成本项目Guide per Pax的不同Vendor值分别是多少，并且将其中最大的和最小的通过不同颜色突出显示。
 			iii. Per Vendor COGS数据特征分析。
 				1) 基于纵向Per Vendor COGS分析的统计。统计各个Event, Event ID的High Season和Low Season的不同年度各个成本项目的Per Pax的标准差，均值，最大值，和最小值等描述统计特征。将标准差大的突出显示。
 				2) 基于横向Per Vendor COGS分析的统计。统计出来各个Year以及Season的各个成本项目d 的不同Vendor的值的标准差，均值，最大值，和最小值等描述统计特征。将标准差大的突出显示。
