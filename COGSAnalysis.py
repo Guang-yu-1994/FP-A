@@ -2,7 +2,9 @@ import os
 import pandas as pd
 import numpy as np
 from datetime import datetime
-import xlsxwriter
+from openpyxl import Workbook
+from openpyxl.styles import PatternFill, Font, Color
+from openpyxl.utils.dataframe import dataframe_to_rows
 
 class COGSAnalysis:
     def __init__(self):
@@ -69,29 +71,57 @@ class COGSAnalysis:
         return vendor_merged, stage_id_data
     
     def format_worksheet(self, worksheet, df, highlight_column=None, highlight_type='std'):
-        """Format Excel worksheet with conditional formatting"""
-        for col_num, col_name in enumerate(df.columns):
-            worksheet.write(0, col_num, col_name)
+        """Format Excel worksheet with conditional formatting using openpyxl"""
+        # Write headers
+        for col_num, col_name in enumerate(df.columns, 1):
+            worksheet.cell(row=1, column=col_num).value = col_name
+        
+        # Write data
+        for r_idx, row in enumerate(dataframe_to_rows(df, index=False, header=False), 2):
+            for c_idx, value in enumerate(row, 1):
+                worksheet.cell(row=r_idx, column=c_idx).value = value
         
         if highlight_column:
+            col_idx = df.columns.get_loc(highlight_column) + 1
+            values = [worksheet.cell(row=r, column=col_idx).value for r in range(2, len(df) + 2)]
+            values = [v for v in values if pd.notnull(v)]
+            
             if highlight_type == 'std':
-                # Highlight high standard deviation
-                format_red = workbook.add_format({'bg_color': '#FFC7CE', 'font_color': '#9C0006'})
-                worksheet.conditional_format(1, df.columns.get_loc(highlight_column), len(df), df.columns.get_loc(highlight_column),
-                                          {'type': 'top', 'value': '10', 'format': format_red})
+                # Highlight top 10 standard deviation
+                std_threshold = sorted(values, reverse=True)[:10]
+                red_fill = PatternFill(start_color='FFC7CE', end_color='FFC7CE', fill_type='solid')
+                red_font = Font(color='9C0006')
+                for row in range(2, len(df) + 2):
+                    cell = worksheet.cell(row=row, column=col_idx)
+                    if cell.value in std_threshold:
+                        cell.fill = red_fill
+                        cell.font = red_font
             elif highlight_type == 'change':
-                # Highlight high percentage change
-                format_red = workbook.add_format({'bg_color': '#FFC7CE', 'font_color': '#9C0006'})
-                worksheet.conditional_format(1, df.columns.get_loc(highlight_column), len(df), df.columns.get_loc(highlight_column),
-                                          {'type': 'top', 'value': '10', 'format': format_red})
+                # Highlight top 10 percentage change
+                change_threshold = sorted(values, reverse=True)[:10]
+                red_fill = PatternFill(start_color='FFC7CE', end_color='FFC7CE', fill_type='solid')
+                red_font = Font(color='9C0006')
+                for row in range(2, len(df) + 2):
+                    cell = worksheet.cell(row=row, column=col_idx)
+                    if cell.value in change_threshold:
+                        cell.fill = red_fill
+                        cell.font = red_font
             elif highlight_type == 'minmax':
                 # Highlight min and max values
-                format_red = workbook.add_format({'bg_color': '#FFC7CE', 'font_color': '#9C0006'})
-                format_green = workbook.add_format({'bg_color': '#C6EFCE', 'font_color': '#006100'})
-                worksheet.conditional_format(1, df.columns.get_loc(highlight_column), len(df), df.columns.get_loc(highlight_column),
-                                          {'type': 'top', 'value': '1', 'format': format_red})
-                worksheet.conditional_format(1, df.columns.get_loc(highlight_column), len(df), df.columns.get_loc(highlight_column),
-                                          {'type': 'bottom', 'value': '1', 'format': format_green})
+                max_val = max(values)
+                min_val = min(values)
+                red_fill = PatternFill(start_color='FFC7CE', end_color='FFC7CE', fill_type='solid')
+                green_fill = PatternFill(start_color='C6EFCE', end_color='C6EFCE', fill_type='solid')
+                red_font = Font(color='9C0006')
+                green_font = Font(color='006100')
+                for row in range(2, len(df) + 2):
+                    cell = worksheet.cell(row=row, column=col_idx)
+                    if cell.value == max_val:
+                        cell.fill = red_fill
+                        cell.font = red_font
+                    elif cell.value == min_val:
+                        cell.fill = green_fill
+                        cell.font = green_font
     
     def per_pax_cogs_analysis(self, stage_id_data):
         """Perform Per Pax COGS analysis"""
@@ -102,87 +132,91 @@ class COGSAnalysis:
         # Add per pax columns
         agg_data = self.add_per_pax_columns(agg_data)
         
-        with pd.ExcelWriter(os.path.join(self.OUTPUT_DIR, 'per_pax_cogs_analysis.xlsx'), engine='xlsxwriter') as writer:
-            workbook = writer.book
+        wb = Workbook()
+        wb.remove(wb.active)  # Remove default sheet
+        
+        # Longitudinal analysis
+        for col in self.cost_columns + ['COGS']:
+            pivot = agg_data.pivot_table(
+                values=f'{col} per Pax',
+                index=['Event', 'Event ID', 'Season'],
+                columns='Year'
+            ).reset_index()
             
-            # Longitudinal analysis
-            for col in self.cost_columns + ['COGS']:
-                pivot = agg_data.pivot_table(
-                    values=f'{col} per Pax',
-                    index=['Event', 'Event ID', 'Season'],
-                    columns='Year'
-                ).reset_index()
-                
-                pivot['Change %'] = ((pivot[2025] - pivot[2024]) / pivot[2024] * 100).replace([np.inf, -np.inf], np.nan)
-                pivot = pivot.sort_values('Change %', ascending=False)
-                
-                pivot.to_excel(writer, sheet_name=f'{col} Longitudinal', index=False)
-                self.format_worksheet(writer.sheets[f'{col} Longitudinal'], pivot, 'Change %', 'change')
+            pivot['Change %'] = ((pivot[2025] - pivot[2024]) / pivot[2024] * 100).replace([np.inf, -np.inf], np.nan)
+            pivot = pivot.sort_values('Change %', ascending=False)
             
-            # Statistical analysis
-            stats_cols = [f'{col} per Pax' for col in self.cost_columns + ['COGS']]
-            stats = agg_data.groupby(['Event', 'Event ID', 'Season'])[stats_cols].agg(['mean', 'std', 'max', 'min']).reset_index()
-            
-            for col in stats_cols:
-                stat_df = stats[[('Event', ''), ('Event ID', ''), ('Season', ''), (col, 'mean'), (col, 'std'), (col, 'max'), (col, 'min')]]
-                stat_df.columns = ['Event', 'Event ID', 'Season', 'Mean', 'Std', 'Max', 'Min']
-                stat_df.to_excel(writer, sheet_name=f'{col} Stats', index=False)
-                self.format_worksheet(writer.sheets[f'{col} Stats'], stat_df, 'Std', 'std')
+            ws = wb.create_sheet(f'{col} Longitudinal')
+            self.format_worksheet(ws, pivot, 'Change %', 'change')
+        
+        # Statistical analysis
+        stats_cols = [f'{col} per Pax' for col in self.cost_columns + ['COGS']]
+        stats = agg_data.groupby(['Event', 'Event ID', 'Season'])[stats_cols].agg(['mean', 'std', 'max', 'min']).reset_index()
+        
+        for col in stats_cols:
+            stat_df = stats[[('Event', ''), ('Event ID', ''), ('Season', ''), (col, 'mean'), (col, 'std'), (col, 'max'), (col, 'min')]]
+            stat_df.columns = ['Event', 'Event ID', 'Season', 'Mean', 'Std', 'Max', 'Min']
+            ws = wb.create_sheet(f'{col} Stats')
+            self.format_worksheet(ws, stat_df, 'Std', 'std')
+        
+        wb.save(os.path.join(self.OUTPUT_DIR, 'per_pax_cogs_analysis.xlsx'))
     
     def per_vendor_cogs_analysis(self, vendor_data):
         """Perform Per Vendor COGS analysis"""
         # Add per pax columns
         vendor_data = self.add_per_pax_columns(vendor_data)
         
-        with pd.ExcelWriter(os.path.join(self.OUTPUT_DIR, 'per_vendor_cogs_analysis.xlsx'), engine='xlsxwriter') as writer:
-            workbook = writer.book
+        wb = Workbook()
+        wb.remove(wb.active)  # Remove default sheet
+        
+        # Longitudinal analysis
+        for col in self.cost_columns + ['COGS']:
+            pivot = vendor_data.pivot_table(
+                values=f'{col} per Pax',
+                index=['Event', 'Event ID', 'Season'],
+                columns='Year'
+            ).reset_index()
             
-            # Longitudinal analysis
-            for col in self.cost_columns + ['COGS']:
-                pivot = vendor_data.pivot_table(
-                    values=f'{col} per Pax',
-                    index=['Event', 'Event ID', 'Season'],
-                    columns='Year'
-                ).reset_index()
-                
-                pivot['Change %'] = ((pivot[2025] - pivot[2024]) / pivot[2024] * 100).replace([np.inf, -np.inf], np.nan)
-                pivot = pivot.sort_values('Change %', ascending=False)
-                
-                pivot.to_excel(writer, sheet_name=f'{col} Longitudinal', index=False)
-                self.format_worksheet(writer.sheets[f'{col} Longitudinal'], pivot, 'Change %', 'change')
+            pivot['Change %'] = ((pivot[2025] - pivot[2024]) / pivot[2024] * 100).replace([np.inf, -np.inf], np.nan)
+            pivot = pivot.sort_values('Change %', ascending=False)
             
-            # Cross-sectional analysis
-            cross_data = vendor_data.groupby(['Vendor', 'Season', 'Year'])[self.cost_columns + ['COGS', 'Actual Pax']].sum().reset_index()
-            cross_data = self.add_per_pax_columns(cross_data)
+            ws = wb.create_sheet(f'{col} Longitudinal')
+            self.format_worksheet(ws, pivot, 'Change %', 'change')
+        
+        # Cross-sectional analysis
+        cross_data = vendor_data.groupby(['Vendor', 'Season', 'Year'])[self.cost_columns + ['COGS', 'Actual Pax']].sum().reset_index()
+        cross_data = self.add_per_pax_columns(cross_data)
+        
+        for col in self.cost_columns + ['COGS']:
+            pivot = cross_data.pivot_table(
+                values=f'{col} per Pax',
+                index=['Vendor'],
+                columns=['Year', 'Season']
+            ).reset_index()
             
-            for col in self.cost_columns + ['COGS']:
-                pivot = cross_data.pivot_table(
-                    values=f'{col} per Pax',
-                    index=['Vendor'],
-                    columns=['Year', 'Season']
-                ).reset_index()
-                
-                pivot.to_excel(writer, sheet_name=f'{col} Cross-sectional', index=False)
-                self.format_worksheet(writer.sheets[f'{col} Cross-sectional'], pivot, f'{col} per Pax', 'minmax')
-            
-            # Statistical analysis - Longitudinal
-            stats_cols = [f'{col} per Pax' for col in self.cost_columns + ['COGS']]
-            long_stats = vendor_data.groupby(['Event', 'Event ID', 'Season'])[stats_cols].agg(['mean', 'std', 'max', 'min']).reset_index()
-            
-            for col in stats_cols:
-                stat_df = long_stats[[('Event', ''), ('Event ID', ''), ('Season', ''), (col, 'mean'), (col, 'std'), (col, 'max'), (col, 'min')]]
-                stat_df.columns = ['Event', 'Event ID', 'Season', 'Mean', 'Std', 'Max', 'Min']
-                stat_df.to_excel(writer, sheet_name=f'{col} Long Stats', index=False)
-                self.format_worksheet(writer.sheets[f'{col} Long Stats'], stat_df, 'Std', 'std')
-            
-            # Statistical analysis - Cross-sectional
-            cross_stats = cross_data.groupby(['Year', 'Season'])[stats_cols].agg(['mean', 'std', 'max', 'min']).reset_index()
-            
-            for col in stats_cols:
-                stat_df = cross_stats[[('Year', ''), ('Season', ''), (col, 'mean'), (col, 'std'), (col, 'max'), (col, 'min')]]
-                stat_df.columns = ['Year', 'Season', 'Mean', 'Std', 'Max', 'Min']
-                stat_df.to_excel(writer, sheet_name=f'{col} Cross Stats', index=False)
-                self.format_worksheet(writer.sheets[f'{col} Cross Stats'], stat_df, 'Std', 'std')
+            ws = wb.create_sheet(f'{col} Cross-sectional')
+            self.format_worksheet(ws, pivot, f'{col} per Pax', 'minmax')
+        
+        # Statistical analysis - Longitudinal
+        stats_cols = [f'{col} per Pax' for col in self.cost_columns + ['COGS']]
+        long_stats = vendor_data.groupby(['Event', 'Event ID', 'Season'])[stats_cols].agg(['mean', 'std', 'max', 'min']).reset_index()
+        
+        for col in stats_cols:
+            stat_df = long_stats[[('Event', ''), ('Event ID', ''), ('Season', ''), (col, 'mean'), (col, 'std'), (col, 'max'), (col, 'min')]]
+            stat_df.columns = ['Event', 'Event ID', 'Season', 'Mean', 'Std', 'Max', 'Min']
+            ws = wb.create_sheet(f'{col} Long Stats')
+            self.format_worksheet(ws, stat_df, 'Std', 'std')
+        
+        # Statistical analysis - Cross-sectional
+        cross_stats = cross_data.groupby(['Year', 'Season'])[stats_cols].agg(['mean', 'std', 'max', 'min']).reset_index()
+        
+        for col in stats_cols:
+            stat_df = cross_stats[[('Year', ''), ('Season', ''), (col, 'mean'), (col, 'std'), (col, 'max'), (col, 'min')]]
+            stat_df.columns = ['Year', 'Season', 'Mean', 'Std', 'Max', 'Min']
+            ws = wb.create_sheet(f'{col} Cross Stats')
+            self.format_worksheet(ws, stat_df, 'Std', 'std')
+        
+        wb.save(os.path.join(self.OUTPUT_DIR, 'per_vendor_cogs_analysis.xlsx'))
     
     def run_analysis(self):
         """Run complete COGS analysis"""
