@@ -1,0 +1,25 @@
+帮我写python代码实现分析统计COGS和Vendor的一个类，使用相对路径写
+	
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+INPUT_DIR = os.path.join(BASE_DIR, 'COGS Inputs')
+OUTPUT_DIR = os.path.join(BASE_DIR, 'COGS Outputs')
+Public_DIR = "C:\City Experience\Public Data Base"
+	1. 准备数据
+		a. 准备Vendor data。读取COGS Inputs下面的AP Prediction.xlsx的Cost Export，选取列Stage ID，Vendor，Event Date，Event，Event ID，Coordinator，Food，Guide，Headsets，Misc，Tickets，Transport，新增列COGS =求和（Coordinator，Food，Guide，Headsets，Misc，Tickets，Transport）。 根据Event Date新增列Season:Q1Q4是Low Season,Q2Q3是High Season，再根据Event Date列新增列Year。筛选只留下2024年之后的数据。如果Vendor一列有空则填充为Blank Vendor
+		b. 准备event accounting data。读取COGS Inputs下面的Revenue Basic Data.xlsx的Event Accounting，选取列Stage ID，Actual Pax，
+		c. 准备vendor级别合并数据。Vendor data左连接event accounting data使用Stage ID, 得到Actual Pax列。将这个合并数据输出在OUTPUT_DIR
+		d. 准备Stage ID 级别数据。Vendor data按照Stage ID，Event Date，Event，Event ID，Season，Year聚合除了Vendor之外的其他列，使用sum聚合，然后左连接左连接event accounting data使用Stage ID, 得到Actual Pax列。将这个合并数据输出在OUTPUT_DIR
+		
+	2. 分析数据（下面过程如果重复用到的功能如新增那些列，如果封装为函数可方便重复使用）
+		a. Per Pax COGS分析，在Stage ID 级别数据的基础上操作，
+			i. 纵向Per Pax COGS分析。按照Event，Event ID，Season，Year聚合Coordinator，Food，Guide，Headsets，Misc，Tickets，Transport，COGS, Actual Pax列，使用sum聚合。新增列Coordinator per Pax，Food per Pax，Guide per Pax，Headsets per Pax，Misc per Pax，Tickets per Pax，Transport per Pax， COGS per Pax，使用对应的列除以Actual Pax得到。我需要统计出来各个Event, Event ID的High Season和Low Season的不同年度各个成本项目的Per Pax的变化,例如能够显示各个Event 和Event ID的Coordinator per Pax项目2025年的数值，Coordinator per Pax 2024年的数值，以及2025年的比2024年的Coordinator per Pax变化的%，并且突出显示（颜色）成本项目per Pax上涨幅度大的。统计方式是每个项目单独的一个表格，按照变化的%降序排列。
+			ii. Per Pax COGS数据特征分析。统计分析各个Event, Event ID的High Season和Low Season的不同年度各个成本项目的Per Pax的标准差，均值，最大值，和最小值等描述统计特征。将标准差大的突出显示。
+			iii. Per Pax COGS分析的所有统计结果都输出在OUTPUT_DIR文件夹下面同一个Excel的不同sheet。
+			
+		b. Per Vendor COGS分析。在vendor级别数据的基础上操作
+			i. 纵向Per Vendor COGS分析。新增列Coordinator per Pax，Food per Pax，Guide per Pax，Headsets per Pax，Misc per Pax，Tickets per Pax，Transport per Pax， COGS per Pax。 使用对应的列除以Actual Pax得到。我需要统计出来各个Event, Event ID的High Season和Low Season的不同年度各个成本项目的Per Pax的变化,如能够显示各个Event 和Event ID的High Season以及Low Season的2025年Coordinator per Pax，2024年Coordinator per Pax，以及2025年比2024年的Coordinator per Pax变化的%，并且突出显示（颜色）成本项目per Pax上涨幅度大的。统计方式是每个项目单独的一个表格，按照变化的%降序排列。
+			ii. 横向Per Vendor COGS分析。按照Vendor，Season，Year聚合Coordinator，Food，Guide，Headsets，Misc，Tickets，Transport，Actual Pax列，使用sum聚合。新增列Coordinator per Pax，Food per Pax，Guide per Pax，Headsets per Pax，Misc per Pax，Tickets per Pax，Transport per Pax， 使用对应的列除以Actual Pax得到。需要统计出来同一Year同一Season各个成本项目 的不同Vendor的值，如2025年High Season的成本项目Guide per Pax的不同Vendor值分别是多少，并且将其中最大的和最小的通过不同颜色突出显示。
+			iii. Per Vendor COGS数据特征分析。
+				1) 基于纵向Per Vendor COGS分析的统计。统计各个Event, Event ID的High Season和Low Season的不同年度各个成本项目的Per Pax的标准差，均值，最大值，和最小值等描述统计特征。将标准差大的突出显示。
+				2) 基于横向Per Vendor COGS分析的统计。统计出来各个Year以及Season的各个成本项目d 的不同Vendor的值的标准差，均值，最大值，和最小值等描述统计特征。将标准差大的突出显示。
+Per Vendor COGS分析的所有统计结果都输出在OUTPUT_DIR文件夹下面同一个Excel的不同sheet。
