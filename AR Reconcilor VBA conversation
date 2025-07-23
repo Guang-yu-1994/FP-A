@@ -1,0 +1,12 @@
+# Set base directory and input/output paths
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+Invoice_Payment_DIR = os.path.join(BASE_DIR, 'Invoice Payment')
+Invoice_Record_DIR = os.path.join(BASE_DIR, 'Invoice Record')
+OUTPUT_DIR = os.path.join(BASE_DIR, 'Reconcile Outputs')
+Public_DIR = "C:\City Experience\Public Data Base"
+
+1. 读取并输出数据。
+		a. 在Invoice_Payment_DIR文件夹下面有多个文件夹，每个文件夹有多个Excel表格，希望每个表的数据都读入然后纵向合并。每个表的结构如下：VIATOR REFERENCE所在的一行是表头，而直到TOTAL PAYMENT这一行的上面一行结束。请设计好程序精准且高效读取每个表格的内容，然后纵向合并的数据。合并后的数据需要对VIATOR REFERENCE，SUPPLIER CONFIRMATION，CURRENCY几列做些处理，首先当然是strip去除空格。其次是对SUPPLIER CONFIRMATION处理，这列是字符串，有的字符串是有_符号的，如果遇到这种字符串就需要取_之后的字符，其他不变。需要根据ARRIVAL DATE一列新建列StartOfMonth,将合并且处理后的数据Invoice_Payment输出为sqlite和csv在OUTPUT_DIR
+		b. 纵向合并且处理后的数据Invoice_Payment需要以VIATOR REFERENCE，SUPPLIER CONFIRMATION，CURRENCY，StartOfMonth几列sum聚合列AMOUNT,将AMOUNT重命名为PAID AMOUNT。将这个聚合处理后的数据Aggregated Invoice Payment输出为excel在OUTPUT_DIR
+		c. 读取Invoice Record文件夹下面的的Bookings Invoiced (Ventrata Export).xlsx的Sheet1，表头是Booking Reference所在行，根据Booking Date新建StartOfMonth，使用Reseller Reference，Booking Reference，Currency，StartOfMonth几列sum聚合Total。这个Aggregated Invoice Record数据Invoice Record输出为Excel的在OUTPUT_DIR
+2. 数据Reconcile分析。Aggregated Invoice Record是我们向客户开的发票的聚合汇总，Aggregated Invoice Payment是客户向我们支付的汇总，现在需要计算各个客户还有多少钱没付给我们。于是使用Aggregated Invoice Record左连接Aggregated Invoice Payment，左边用列[Reseller Reference，Booking Reference,Currency],右边用列[SUPPLIER CONFIRMATION,VIATOR REFERENCE,CURRENCY], 连接数据之后新增列unpaid = Total列-PAID AMOUNT列。将这个数据输出为excel在OUTPUT_DIR
