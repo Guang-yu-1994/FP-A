@@ -1,0 +1,223 @@
+'代码修正，用中文对话，用英文写代码：
+	'1. 增加程序统计总共汇集多少个xls和多少个ACT文件夹，写在这个工作簿的这个工作表的A1单元格
+	'2. 有的xls可以再protected view打开，有的不行，为何，是否能够通过VBA程序设计解决？
+	'3. 对于内存不足的问题，请设计程序解决。是否一定要打开文件，使用GetObject在不打卡的情况下是否能够进行相同的数据复制粘贴？是否也解决了内存问题，每搞完一个立即释放内存？还是有其他解决方案？
+Attribute VB_Name = "Module1"
+
+Option Explicit
+
+'==================================================================================================
+' Main Procedure: Loops through all qualifying folders and files.
+' 1. Sets the root directory for processing.
+' 2. Prepares the summary and temporary worksheets.
+' 3. Uses FileSystemObject to iterate through folders and files.
+'    - Finds all subfolders under the root directory containing "ACT".
+'    - In these subfolders, finds all .xls files containing "ACT".
+' 4. Calls ProcessSingleFile for each found file.
+'==================================================================================================
+Sub Main_ProcessAllFiles()
+
+    ' --- Configuration Section ---
+    Const ROOT_FOLDER_NAME As String = "DirectSale Reconcile Inputs" ' Source data root folder name
+    Const FOLDER_KEYWORD As String = "ACT" ' Keyword for target subfolders
+    Const FILE_KEYWORD As String = "ACT"   ' Keyword for target files
+    ' --- End Configuration Section ---
+
+    Dim fso As Object
+    Dim rootFolder As Object
+    Dim subFolder As Object
+    Dim fileItem As Object
+    Dim basePath As String
+    Dim wsSummary As Worksheet
+    Dim wsTemp As Worksheet
+
+    ' Create a Scripting.FileSystemObject for file system operations
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    
+    ' Build the base path: the folder where the current workbook is located
+    basePath = ThisWorkbook.Path & "\" & ROOT_FOLDER_NAME
+
+    ' Check if the root folder exists
+    If Not fso.FolderExists(basePath) Then
+        MsgBox "Error: The data source folder '" & basePath & "' was not found.", vbCritical, "Folder Not Found"
+        Exit Sub
+    End If
+
+    Application.ScreenUpdating = False
+    Application.DisplayAlerts = False
+
+    On Error GoTo ErrorHandler
+
+    ' Step 1: Prepare summary and temporary worksheets
+    SetupSheets wsSummary, wsTemp
+
+    ' Step 2: Loop through folders and files
+    Set rootFolder = fso.GetFolder(basePath)
+
+    ' Loop through all subfolders in the root directory
+    For Each subFolder In rootFolder.SubFolders
+        ' Check if the subfolder name contains the keyword "ACT" (case-insensitive)
+        If InStr(1, subFolder.Name, FOLDER_KEYWORD, vbTextCompare) > 0 Then
+            ' Loop through all files in the current subfolder
+            For Each fileItem In subFolder.Files
+                ' Check if the file name contains "ACT" and is an .xls file (case-insensitive)
+                If InStr(1, fileItem.Name, FILE_KEYWORD, vbTextCompare) > 0 And LCase(fso.GetExtensionName(fileItem.Name)) = "xls" Then
+                    ' Step 3: If the file meets the criteria, call the processing procedure
+                    ProcessSingleFile fileItem.Path, wsSummary, wsTemp
+                End If
+            Next fileItem
+        End If
+    Next subFolder
+
+    MsgBox "All data processing is complete! Please check the 'Summary Sheet'.", vbInformation, "Processing Complete"
+
+CleanUp:
+    Application.ScreenUpdating = True
+    Application.DisplayAlerts = True
+    Set fso = Nothing
+    Set rootFolder = Nothing
+    Set subFolder = Nothing
+    Set fileItem = Nothing
+    Exit Sub
+
+ErrorHandler:
+    MsgBox "An error occurred in the main procedure: " & Err.Description, vbCritical, "Error"
+    Resume CleanUp
+
+End Sub
+
+
+'==================================================================================================
+' Helper Procedure 1: Prepares the worksheets (creates or clears them).
+'==================================================================================================
+Sub SetupSheets(ByRef wsSummary As Worksheet, ByRef wsTemp As Worksheet)
+    On Error Resume Next
+    Set wsTemp = ThisWorkbook.Sheets("Intermediate Sheet")
+    If wsTemp Is Nothing Then
+        Set wsTemp = ThisWorkbook.Sheets.Add(After:=ThisWorkbook.Sheets(ThisWorkbook.Sheets.Count))
+        wsTemp.Name = "Intermediate Sheet"
+    End If
+    wsTemp.Cells.Clear
+
+    Set wsSummary = ThisWorkbook.Sheets("Summary Sheet")
+    If wsSummary Is Nothing Then
+        Set wsSummary = ThisWorkbook.Sheets.Add(After:=ThisWorkbook.Sheets(ThisWorkbook.Sheets.Count))
+        wsSummary.Name = "Summary Sheet"
+    End If
+    wsSummary.Cells.Clear
+    On Error GoTo 0
+
+    ' Create header row in the summary sheet
+    With wsSummary
+        .Cells(1, 1).Value = "Submission Date"
+        .Cells(1, 2).Value = "Account #"
+        .Cells(1, 3).Value = "Expire Date"
+        .Cells(1, 4).Value = "Amount"
+    End With
+End Sub
+
+
+'==================================================================================================
+' Helper Procedure 2: Processes a single Excel file.
+' 1. Opens the file from the provided path.
+' 2. Loops to find each defined keyword (e.g., "Submission Date").
+' 3. Copies the relevant column to the temporary worksheet.
+' 4. Cleans the data in the temporary worksheet (deletes blank rows, repeated headers, etc.).
+' 5. Appends the cleaned data to the end of the summary sheet.
+' 6. Closes the source data file.
+'==================================================================================================
+Sub ProcessSingleFile(ByVal fullPath As String, ByVal wsSummary As Worksheet, ByVal wsTemp As Worksheet)
+
+    Dim wbSource As Workbook
+    Dim wsSource As Worksheet
+    Dim findRange As Range
+    Dim lastRowSource As Long
+    Dim lastRowTemp As Long
+    Dim nextSummaryRow As Long
+    Dim colCounter As Integer
+    Dim searchKey As Variant
+    Dim targetColumnSource As Long
+    Dim tempColOffset As Long
+    Dim i As Long
+    Dim copyCurrentColumn As Boolean
+
+    ' Define the headers to find and their corresponding processing logic
+    Dim searchKeys As Variant
+    searchKeys = Array( _
+        Array("Submission Date", 1, True), _
+        Array("Account #", 2, False), _
+        Array("Expire Date", 3, True), _
+        Array("Amount", 4, False) _
+    )
+
+    On Error GoTo ErrorHandler
+
+    ' Open the source workbook
+    Set wbSource = Workbooks.Open(fullPath, ReadOnly:=True)
+    Set wsSource = wbSource.Sheets(1)
+
+    ' Loop through each keyword to be found
+    For colCounter = LBound(searchKeys) To UBound(searchKeys)
+        searchKey = searchKeys(colCounter)(0)
+        tempColOffset = searchKeys(colCounter)(1)
+        copyCurrentColumn = searchKeys(colCounter)(2)
+
+        wsTemp.Cells.ClearContents ' Clear the temporary worksheet before each loop
+
+        Set findRange = wsSource.Cells.Find(What:=searchKey, LookIn:=xlValues, LookAt:=xlWhole, MatchCase:=False)
+
+        If Not findRange Is Nothing Then
+            If copyCurrentColumn Then
+                targetColumnSource = findRange.Column
+            Else
+                targetColumnSource = findRange.Column - 1
+                If targetColumnSource < 1 Then GoTo NextKey ' If in column A, cannot get the column to the left, so skip this key
+            End If
+
+            lastRowSource = wsSource.Cells(wsSource.Rows.Count, targetColumnSource).End(xlUp).Row
+            If lastRowSource <= findRange.Row Then GoTo NextKey ' If there is no data below the header row, skip
+
+            ' Copy data to the temporary worksheet
+            wsSource.Range(wsSource.Cells(findRange.Row + 1, targetColumnSource), wsSource.Cells(lastRowSource, targetColumnSource)).Copy
+            wsTemp.Cells(2, 1).PasteSpecial xlPasteValuesAndNumberFormats
+            Application.CutCopyMode = False
+
+            ' --- Data Cleaning Logic (Loop Deletion) ---
+            lastRowTemp = wsTemp.Cells(wsTemp.Rows.Count, 1).End(xlUp).Row
+            If lastRowTemp >= 2 Then
+                For i = lastRowTemp To 2 Step -1
+                    Dim cellValue As String
+                    cellValue = Trim(wsTemp.Cells(i, 1).Value)
+                    If cellValue = "" Or cellValue = CStr(searchKey) Or (CStr(searchKey) = "Submission Date" And InStr(1, cellValue, "Submission Count", vbTextCompare) > 0) Then
+                        wsTemp.Rows(i).Delete
+                    End If
+                Next i
+            End If
+            ' --- End Data Cleaning ---
+
+            ' Copy the cleaned data to the summary sheet
+            lastRowTemp = wsTemp.Cells(wsTemp.Rows.Count, 1).End(xlUp).Row
+            If lastRowTemp >= 2 Then
+                ' Key Step: Find the next empty row in the summary sheet to append data
+                nextSummaryRow = wsSummary.Cells(wsSummary.Rows.Count, tempColOffset).End(xlUp).Row + 1
+                wsTemp.Range("A2:A" & lastRowTemp).Copy
+                wsSummary.Cells(nextSummaryRow, tempColOffset).PasteSpecial xlPasteValuesAndNumberFormats
+                Application.CutCopyMode = False
+            End If
+        End If
+
+NextKey:
+    Next colCounter
+
+CleanUp:
+    If Not wbSource Is Nothing Then
+        wbSource.Close SaveChanges:=False
+    End If
+    Exit Sub
+
+ErrorHandler:
+    MsgBox "An error occurred while processing the file '" & fullPath & "':" & vbCrLf & Err.Description, vbExclamation, "File Processing Error"
+    Resume CleanUp
+End Sub
+
+
