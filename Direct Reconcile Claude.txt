@@ -7,7 +7,7 @@ Private g_TotalXlsFiles As Long
 Private g_TotalACTFolders As Long
 
 '==================================================================================================
-' Main Procedure: Fixed data corruption and added output folder functionality
+' Main Procedure: Enhanced version with statistics and memory optimization
 '==================================================================================================
 Sub Main_ProcessAllFiles()
 
@@ -50,12 +50,11 @@ Sub Main_ProcessAllFiles()
     Application.ScreenUpdating = False
     Application.EnableEvents = False
     Application.Calculation = xlCalculationManual
-    ' Note: Keep DisplayAlerts = True to see file corruption warnings
 
     On Error GoTo ErrorHandler
 
     ' Setup worksheets
-    SetupSheets wsSummary, wsTemp
+    SetupWorksheets wsSummary, wsTemp
 
     Set rootFolder = fso.GetFolder(basePath)
 
@@ -75,7 +74,7 @@ Sub Main_ProcessAllFiles()
                     ProcessSingleFileRobust fileItem.Path, wsSummary, wsTemp
                     
                     ' Force memory cleanup after each file
-                    ForceMemoryCleanup
+                    PerformMemoryCleanup
                 End If
             Next fileItem
         End If
@@ -85,7 +84,7 @@ Sub Main_ProcessAllFiles()
     WriteStatisticsToSheet1
 
     ' Save Summary Sheet as separate workbook
-    SaveSummarySheetAsNewWorkbook wsSummary, outputPath
+    SaveSummaryToOutputFolder wsSummary, outputPath
 
     MsgBox "All data processing complete!" & vbCrLf & _
            "Processed " & g_TotalXlsFiles & " XLS files" & vbCrLf & _
@@ -134,61 +133,9 @@ Sub WriteStatisticsToSheet1()
 End Sub
 
 '==================================================================================================
-' Save Summary Sheet as separate workbook in output folder
+' Setup worksheets
 '==================================================================================================
-Sub SaveSummarySheetAsNewWorkbook(ByVal wsSummary As Worksheet, ByVal outputPath As String)
-    Dim newWb As Workbook
-    Dim newWs As Worksheet
-    Dim fileName As String
-    Dim fullOutputPath As String
-    
-    On Error GoTo SaveError
-    
-    ' Create new workbook
-    Set newWb = Application.Workbooks.Add
-    Set newWs = newWb.Sheets(1)
-    newWs.Name = "Summary Data"
-    
-    ' Copy all data from summary sheet to new workbook
-    wsSummary.UsedRange.Copy
-    newWs.Range("A1").PasteSpecial xlPasteAll
-    Application.CutCopyMode = False
-    
-    ' Format the new worksheet
-    With newWs
-        .Range("A1:D1").Font.Bold = True
-        .Range("A1:D1").Interior.Color = RGB(200, 200, 200)
-        .Columns("A:D").AutoFit
-    End With
-    
-    ' Generate filename with timestamp
-    fileName = "Summary_" & Format(Now, "yyyymmdd_hhmmss") & ".xlsx"
-    fullOutputPath = outputPath & "\" & fileName
-    
-    ' Save and close new workbook
-    Application.DisplayAlerts = False
-    newWb.SaveAs fullOutputPath, FileFormat:=xlOpenXMLWorkbook
-    newWb.Close SaveChanges:=False
-    Application.DisplayAlerts = True
-    
-    Set newWb = Nothing
-    Set newWs = Nothing
-    Exit Sub
-    
-SaveError:
-    Application.DisplayAlerts = True
-    If Not newWb Is Nothing Then
-        newWb.Close SaveChanges:=False
-        Set newWb = Nothing
-    End If
-    MsgBox "Error saving summary file: " & Err.Description, vbExclamation, "Save Error"
-    
-End Sub
-
-'==================================================================================================
-' Helper Procedure: Setup worksheets
-'==================================================================================================
-Sub SetupSheets(ByRef wsSummary As Worksheet, ByRef wsTemp As Worksheet)
+Sub SetupWorksheets(ByRef wsSummary As Worksheet, ByRef wsTemp As Worksheet)
     On Error Resume Next
     
     ' Setup temporary worksheet
@@ -250,7 +197,7 @@ Sub ProcessSingleFileRobust(ByVal fullPath As String, ByVal wsSummary As Workshe
     On Error GoTo ErrorHandler
 
     ' Open file with enhanced error handling for corrupted files
-    Set wbSource = OpenFileRobust(fullPath)
+    Set wbSource = OpenFileWithRepair(fullPath)
     If wbSource Is Nothing Then GoTo ErrorHandler
 
     ' Always use the first worksheet
@@ -265,8 +212,13 @@ Sub ProcessSingleFileRobust(ByVal fullPath As String, ByVal wsSummary As Workshe
         ' Clear temporary worksheet
         wsTemp.Cells.ClearContents
 
-        ' Find the keyword with enhanced search
-        Set findRange = FindKeywordRobust(wsSource, CStr(searchKey))
+        ' Find the keyword
+        Set findRange = wsSource.Cells.Find( _
+            What:=searchKey, _
+            LookIn:=xlValues, _
+            LookAt:=xlWhole, _
+            MatchCase:=False _
+        )
 
         If Not findRange Is Nothing Then
             ' Determine target column
@@ -281,14 +233,14 @@ Sub ProcessSingleFileRobust(ByVal fullPath As String, ByVal wsSummary As Workshe
             lastRowSource = wsSource.Cells(wsSource.Rows.Count, targetColumnSource).End(xlUp).Row
             If lastRowSource <= findRange.Row Then GoTo NextKey
 
-            ' Copy data using values only (prevents formula corruption)
-            CopyDataSafely wsSource, wsTemp, findRange.Row + 1, lastRowSource, targetColumnSource
+            ' Copy data safely to prevent corruption
+            CopyDataRowByRow wsSource, wsTemp, findRange.Row + 1, lastRowSource, targetColumnSource
 
             ' Clean data efficiently
-            CleanDataInPlace wsTemp, CStr(searchKey)
+            CleanTempData wsTemp, CStr(searchKey)
 
             ' Copy cleaned data to summary
-            CopyCleanedDataToSummary wsTemp, wsSummary, tempColOffset
+            AppendToSummarySheet wsTemp, wsSummary, tempColOffset
         End If
 
 NextKey:
@@ -305,7 +257,7 @@ CleanUp:
         Set wsSource = Nothing
     End If
     
-    ForceMemoryCleanup
+    PerformMemoryCleanup
     Exit Sub
 
 ErrorHandler:
@@ -316,9 +268,9 @@ ErrorHandler:
 End Sub
 
 '==================================================================================================
-' Enhanced file opening to handle corruption
+' Enhanced file opening to handle corruption and Protected View
 '==================================================================================================
-Function OpenFileRobust(ByVal fullPath As String) As Workbook
+Function OpenFileWithRepair(ByVal fullPath As String) As Workbook
     Dim wb As Workbook
     
     On Error Resume Next
@@ -339,7 +291,7 @@ Function OpenFileRobust(ByVal fullPath As String) As Workbook
             wb.ProtectedViewWindow.Edit
             DoEvents
         End If
-        Set OpenFileRobust = wb
+        Set OpenFileWithRepair = wb
         Exit Function
     End If
     
@@ -351,54 +303,21 @@ Function OpenFileRobust(ByVal fullPath As String) As Workbook
     )
     
     If Not wb Is Nothing Then
-        Set OpenFileRobust = wb
+        Set OpenFileWithRepair = wb
         Exit Function
     End If
     
     ' Method 3: Basic open as last resort
     Set wb = Application.Workbooks.Open(fullPath, ReadOnly:=True)
-    Set OpenFileRobust = wb
+    Set OpenFileWithRepair = wb
     
 End Function
 
 '==================================================================================================
-' Enhanced keyword finding with multiple attempts
+' Safe data copying to prevent corruption - row by row processing
 '==================================================================================================
-Function FindKeywordRobust(ByVal ws As Worksheet, ByVal keyword As String) As Range
-    Dim foundRange As Range
-    
-    On Error Resume Next
-    
-    ' Try exact match first
-    Set foundRange = ws.Cells.Find( _
-        What:=keyword, _
-        LookIn:=xlValues, _
-        LookAt:=xlWhole, _
-        MatchCase:=False _
-    )
-    
-    If Not foundRange Is Nothing Then
-        Set FindKeywordRobust = foundRange
-        Exit Function
-    End If
-    
-    ' Try partial match if exact match fails
-    Set foundRange = ws.Cells.Find( _
-        What:=keyword, _
-        LookIn:=xlValues, _
-        LookAt:=xlPart, _
-        MatchCase:=False _
-    )
-    
-    Set FindKeywordRobust = foundRange
-    
-End Function
-
-'==================================================================================================
-' Safe data copying to prevent corruption
-'==================================================================================================
-Sub CopyDataSafely(ByVal wsSource As Worksheet, ByVal wsTemp As Worksheet, _
-                   ByVal startRow As Long, ByVal endRow As Long, ByVal sourceCol As Long)
+Sub CopyDataRowByRow(ByVal wsSource As Worksheet, ByVal wsTemp As Worksheet, _
+                     ByVal startRow As Long, ByVal endRow As Long, ByVal sourceCol As Long)
     
     Dim i As Long
     Dim tempRow As Long
@@ -412,8 +331,8 @@ Sub CopyDataSafely(ByVal wsSource As Worksheet, ByVal wsTemp As Worksheet, _
     For i = startRow To endRow
         cellVal = wsSource.Cells(i, sourceCol).Value
         
-        ' Only copy if value is not an error
-        If Not IsError(cellVal) Then
+        ' Only copy if value is not an error and not empty
+        If Not IsError(cellVal) And Trim(CStr(cellVal)) <> "" Then
             wsTemp.Cells(tempRow, 1).Value = cellVal
             tempRow = tempRow + 1
         End If
@@ -422,9 +341,9 @@ Sub CopyDataSafely(ByVal wsSource As Worksheet, ByVal wsTemp As Worksheet, _
 End Sub
 
 '==================================================================================================
-' Efficient in-place data cleaning
+' Clean data in temporary worksheet
 '==================================================================================================
-Sub CleanDataInPlace(ByVal wsTemp As Worksheet, ByVal searchKey As String)
+Sub CleanTempData(ByVal wsTemp As Worksheet, ByVal searchKey As String)
     Dim lastRow As Long
     Dim i As Long
     Dim cellValue As String
@@ -438,8 +357,8 @@ Sub CleanDataInPlace(ByVal wsTemp As Worksheet, ByVal searchKey As String)
             
             ' Remove empty cells, duplicate headers, and specific unwanted content
             If cellValue = "" Or _
-               cellValue = CStr(searchKey) Or _
-               (CStr(searchKey) = "Submission Date" And InStr(1, cellValue, "Submission Count", vbTextCompare) > 0) Then
+               cellValue = searchKey Or _
+               (searchKey = "Submission Date" And InStr(1, cellValue, "Submission Count", vbTextCompare) > 0) Then
                 wsTemp.Rows(i).Delete
             End If
         Next i
@@ -447,9 +366,9 @@ Sub CleanDataInPlace(ByVal wsTemp As Worksheet, ByVal searchKey As String)
 End Sub
 
 '==================================================================================================
-' Efficient copying of cleaned data to summary sheet
+' Append cleaned data to summary sheet
 '==================================================================================================
-Sub CopyCleanedDataToSummary(ByVal wsTemp As Worksheet, ByVal wsSummary As Worksheet, ByVal targetColumn As Integer)
+Sub AppendToSummarySheet(ByVal wsTemp As Worksheet, ByVal wsSummary As Worksheet, ByVal targetColumn As Integer)
     Dim lastRowTemp As Long
     Dim nextSummaryRow As Long
     Dim i As Long
@@ -474,44 +393,9 @@ Sub CopyCleanedDataToSummary(ByVal wsTemp As Worksheet, ByVal wsSummary As Works
 End Sub
 
 '==================================================================================================
-' Helper Procedure: Setup worksheets
+' Save Summary Sheet as separate workbook in output folder
 '==================================================================================================
-Sub SetupSheets(ByRef wsSummary As Worksheet, ByRef wsTemp As Worksheet)
-    On Error Resume Next
-    
-    ' Setup temporary worksheet
-    Set wsTemp = ThisWorkbook.Sheets("Intermediate Sheet")
-    If wsTemp Is Nothing Then
-        Set wsTemp = ThisWorkbook.Sheets.Add(After:=ThisWorkbook.Sheets(ThisWorkbook.Sheets.Count))
-        wsTemp.Name = "Intermediate Sheet"
-    End If
-    wsTemp.Cells.Clear
-
-    ' Setup summary worksheet
-    Set wsSummary = ThisWorkbook.Sheets("Summary Sheet")
-    If wsSummary Is Nothing Then
-        Set wsSummary = ThisWorkbook.Sheets.Add(After:=ThisWorkbook.Sheets(ThisWorkbook.Sheets.Count))
-        wsSummary.Name = "Summary Sheet"
-    End If
-    wsSummary.Cells.Clear
-    On Error GoTo 0
-
-    ' Create header row
-    With wsSummary
-        .Cells(1, 1).Value = "Submission Date"
-        .Cells(1, 2).Value = "Account #"
-        .Cells(1, 3).Value = "Expire Date"
-        .Cells(1, 4).Value = "Amount"
-        ' Format header row
-        .Range("A1:D1").Font.Bold = True
-        .Range("A1:D1").Interior.Color = RGB(200, 200, 200)
-    End With
-End Sub
-
-'==================================================================================================
-' Save Summary Sheet as separate workbook with timestamp
-'==================================================================================================
-Sub SaveSummarySheetAsNewWorkbook(ByVal wsSummary As Worksheet, ByVal outputPath As String)
+Sub SaveSummaryToOutputFolder(ByVal wsSummary As Worksheet, ByVal outputPath As String)
     Dim newWb As Workbook
     Dim newWs As Worksheet
     Dim fileName As String
@@ -561,9 +445,9 @@ SaveError:
 End Sub
 
 '==================================================================================================
-' Aggressive memory cleanup
+' Memory cleanup procedure
 '==================================================================================================
-Sub ForceMemoryCleanup()
+Sub PerformMemoryCleanup()
     ' Clear clipboard
     Application.CutCopyMode = False
     
