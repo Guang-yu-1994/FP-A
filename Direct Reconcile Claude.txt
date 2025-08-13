@@ -7,8 +7,7 @@ Private g_TotalXlsFiles As Long
 Private g_TotalACTFolders As Long
 
 '==================================================================================================
-' Main Procedure: Enhanced version with statistics and memory optimization
-' Can be run directly - all dependencies included
+' Main Procedure: Optimized for irregular data with memory management
 '==================================================================================================
 Sub Main_ProcessAllFiles()
 
@@ -62,12 +61,11 @@ Sub Main_ProcessAllFiles()
                    LCase(fso.GetExtensionName(fileItem.Name)) = "xls" Then
                     g_TotalXlsFiles = g_TotalXlsFiles + 1
                     
-                    ' Process single file with enhanced error handling
-                    ProcessSingleFileEnhanced fileItem.Path, wsSummary, wsTemp
+                    ' Process single file with memory optimization
+                    ProcessSingleFileOptimized fileItem.Path, wsSummary, wsTemp
                     
-                    ' Force memory cleanup
-                    DoEvents
-                    Application.CutCopyMode = False
+                    ' Aggressive memory cleanup after each file
+                    ForceMemoryCleanup
                 End If
             Next fileItem
         End If
@@ -77,7 +75,7 @@ Sub Main_ProcessAllFiles()
     With ThisWorkbook.ActiveSheet
         .Cells(1, 1).Value = "Statistics: Processed " & g_TotalXlsFiles & " XLS files from " & g_TotalACTFolders & " ACT folders"
         .Cells(1, 1).Font.Bold = True
-        .Cells(1, 1).Interior.Color = RGB(255, 255, 0) ' Yellow background
+        .Cells(1, 1).Interior.Color = RGB(255, 255, 0)
         .Columns("A:A").AutoFit
     End With
 
@@ -142,139 +140,10 @@ Sub SetupSheets(ByRef wsSummary As Worksheet, ByRef wsTemp As Worksheet)
 End Sub
 
 '==================================================================================================
-' Enhanced file processing with multiple fallback methods
+' Optimized file processing with memory management and Protected View handling
+' Uses traditional method but with enhanced memory management
 '==================================================================================================
-Sub ProcessSingleFileEnhanced(ByVal fullPath As String, ByVal wsSummary As Worksheet, ByVal wsTemp As Worksheet)
-    
-    On Error Resume Next
-    
-    ' Method 1: Try ADO connection (fastest, no file opening, bypasses Protected View)
-    If ProcessFileWithADO(fullPath, wsSummary, wsTemp) Then
-        Exit Sub
-    End If
-    
-    ' Method 2: Try traditional opening with Protected View handling
-    ProcessSingleFileTraditional fullPath, wsSummary, wsTemp
-    
-End Sub
-
-'==================================================================================================
-' Method 1: ADO Connection (No file opening, solves Protected View and memory issues)
-'==================================================================================================
-Function ProcessFileWithADO(ByVal fullPath As String, ByVal wsSummary As Worksheet, ByVal wsTemp As Worksheet) As Boolean
-    
-    Dim conn As Object
-    Dim rs As Object
-    Dim sql As String
-    Dim connectionString As String
-    Dim worksheetName As String
-    
-    On Error GoTo ADOCleanup
-    
-    ' Create ADO objects
-    Set conn = CreateObject("ADODB.Connection")
-    Set rs = CreateObject("ADODB.Recordset")
-    
-    ' Build connection string for Excel files
-    connectionString = "Provider=Microsoft.ACE.OLEDB.12.0;" & _
-                      "Data Source=" & fullPath & ";" & _
-                      "Extended Properties=""Excel 8.0;HDR=Yes;IMEX=1;"";"
-    
-    ' Try to open connection
-    conn.Open connectionString
-    
-    ' Get first worksheet name
-    Set rs = conn.OpenSchema(20) ' 20 = adSchemaTables
-    If Not rs.EOF Then
-        worksheetName = rs.Fields("TABLE_NAME").Value
-        ' Remove $ suffix if present
-        If Right(worksheetName, 1) = "$" Then
-            worksheetName = Left(worksheetName, Len(worksheetName) - 1)
-        End If
-    Else
-        GoTo ADOCleanup
-    End If
-    rs.Close
-    
-    ' Define columns to search for
-    Dim searchColumns As Variant
-    searchColumns = Array( _
-        Array("Submission Date", 1), _
-        Array("Account #", 2), _
-        Array("Expire Date", 3), _
-        Array("Amount", 4) _
-    )
-    
-    Dim i As Integer
-    Dim nextRow As Long
-    Dim colName As String
-    Dim targetCol As Integer
-    
-    ' Process each required column
-    For i = LBound(searchColumns) To UBound(searchColumns)
-        colName = searchColumns(i)(0)
-        targetCol = searchColumns(i)(1)
-        
-        ' Build SQL query
-        sql = "SELECT [" & colName & "] FROM [" & worksheetName & "$] WHERE [" & colName & "] IS NOT NULL AND [" & colName & "] <> ''"
-        
-        On Error Resume Next
-        Set rs = CreateObject("ADODB.Recordset")
-        rs.Open sql, conn, 1, 1 ' adOpenKeyset, adLockReadOnly
-        
-        If Err.Number = 0 And Not rs.EOF Then
-            ' Find next empty row in summary sheet
-            nextRow = wsSummary.Cells(wsSummary.Rows.Count, targetCol).End(xlUp).Row + 1
-            
-            ' Skip header if we're starting from row 1
-            If nextRow = 1 Then nextRow = 2
-            
-            ' Copy data row by row
-            Do While Not rs.EOF
-                Dim cellValue As String
-                cellValue = Trim(CStr(rs.Fields(0).Value & ""))
-                
-                ' Filter out invalid data
-                If cellValue <> "" And cellValue <> colName And _
-                   Not (colName = "Submission Date" And InStr(1, cellValue, "Submission Count", vbTextCompare) > 0) Then
-                    wsSummary.Cells(nextRow, targetCol).Value = rs.Fields(0).Value
-                    nextRow = nextRow + 1
-                End If
-                
-                rs.MoveNext
-            Loop
-            
-            rs.Close
-        End If
-        On Error GoTo ADOCleanup
-        
-        Set rs = Nothing
-    Next i
-    
-    conn.Close
-    Set conn = Nothing
-    
-    ProcessFileWithADO = True
-    Exit Function
-    
-ADOCleanup:
-    On Error Resume Next
-    If Not rs Is Nothing Then
-        rs.Close
-        Set rs = Nothing
-    End If
-    If Not conn Is Nothing Then
-        conn.Close
-        Set conn = Nothing
-    End If
-    ProcessFileWithADO = False
-
-End Function
-
-'==================================================================================================
-' Method 2: Traditional file opening with Protected View handling
-'==================================================================================================
-Sub ProcessSingleFileTraditional(ByVal fullPath As String, ByVal wsSummary As Worksheet, ByVal wsTemp As Worksheet)
+Sub ProcessSingleFileOptimized(ByVal fullPath As String, ByVal wsSummary As Worksheet, ByVal wsTemp As Worksheet)
 
     Dim wbSource As Workbook
     Dim wsSource As Worksheet
@@ -288,7 +157,9 @@ Sub ProcessSingleFileTraditional(ByVal fullPath As String, ByVal wsSummary As Wo
     Dim tempColOffset As Long
     Dim i As Long
     Dim copyCurrentColumn As Boolean
+    Dim dataRange As Range
 
+    ' Define search parameters
     Dim searchKeys As Variant
     searchKeys = Array( _
         Array("Submission Date", 1, True), _
@@ -299,23 +170,9 @@ Sub ProcessSingleFileTraditional(ByVal fullPath As String, ByVal wsSummary As Wo
 
     On Error GoTo ErrorHandler
 
-    ' Try to open file with multiple parameters to avoid Protected View
-    Set wbSource = Application.Workbooks.Open( _
-        Filename:=fullPath, _
-        ReadOnly:=True, _
-        UpdateLinks:=False, _
-        AddToMru:=False, _
-        IgnoreReadOnlyRecommended:=True, _
-        CorruptLoad:=xlExtractData _
-    )
-
-    ' Handle Protected View if present
-    On Error Resume Next
-    If Not wbSource.ProtectedViewWindow Is Nothing Then
-        wbSource.ProtectedViewWindow.Edit
-        DoEvents ' Wait for edit mode to enable
-    End If
-    On Error GoTo ErrorHandler
+    ' Try multiple methods to open the file (handles Protected View)
+    Set wbSource = OpenFileWithFallback(fullPath)
+    If wbSource Is Nothing Then GoTo ErrorHandler
 
     Set wsSource = wbSource.Sheets(1)
 
@@ -325,8 +182,10 @@ Sub ProcessSingleFileTraditional(ByVal fullPath As String, ByVal wsSummary As Wo
         tempColOffset = searchKeys(colCounter)(1)
         copyCurrentColumn = searchKeys(colCounter)(2)
 
+        ' Clear temporary worksheet for each column
         wsTemp.Cells.ClearContents
 
+        ' Find the keyword
         Set findRange = wsSource.Cells.Find( _
             What:=searchKey, _
             LookIn:=xlValues, _
@@ -335,6 +194,7 @@ Sub ProcessSingleFileTraditional(ByVal fullPath As String, ByVal wsSummary As Wo
         )
 
         If Not findRange Is Nothing Then
+            ' Determine target column based on parameter
             If copyCurrentColumn Then
                 targetColumnSource = findRange.Column
             Else
@@ -342,57 +202,158 @@ Sub ProcessSingleFileTraditional(ByVal fullPath As String, ByVal wsSummary As Wo
                 If targetColumnSource < 1 Then GoTo NextKey
             End If
 
+            ' Find the last row with data in target column
             lastRowSource = wsSource.Cells(wsSource.Rows.Count, targetColumnSource).End(xlUp).Row
             If lastRowSource <= findRange.Row Then GoTo NextKey
 
-            ' Copy data to temporary worksheet
-            wsSource.Range( _
+            ' Use more efficient copying method for large ranges
+            Set dataRange = wsSource.Range( _
                 wsSource.Cells(findRange.Row + 1, targetColumnSource), _
                 wsSource.Cells(lastRowSource, targetColumnSource) _
-            ).Copy
+            )
             
-            wsTemp.Cells(2, 1).PasteSpecial xlPasteValuesAndNumberFormats
-            Application.CutCopyMode = False
-
-            ' Clean data (remove empty rows and duplicate headers)
-            lastRowTemp = wsTemp.Cells(wsTemp.Rows.Count, 1).End(xlUp).Row
-            If lastRowTemp >= 2 Then
-                For i = lastRowTemp To 2 Step -1
-                    Dim cellValue As String
-                    cellValue = Trim(wsTemp.Cells(i, 1).Value & "")
-                    If cellValue = "" Or cellValue = CStr(searchKey) Or _
-                       (CStr(searchKey) = "Submission Date" And InStr(1, cellValue, "Submission Count", vbTextCompare) > 0) Then
-                        wsTemp.Rows(i).Delete
-                    End If
-                Next i
-            End If
-
+            ' Copy values only (not formulas) to reduce memory usage
+            wsTemp.Range("A2").Resize(dataRange.Rows.Count, 1).Value = dataRange.Value
+            
+            ' Clean data efficiently
+            CleanDataInPlace wsTemp, searchKey
+            
             ' Copy cleaned data to summary sheet
-            lastRowTemp = wsTemp.Cells(wsTemp.Rows.Count, 1).End(xlUp).Row
-            If lastRowTemp >= 2 Then
-                nextSummaryRow = wsSummary.Cells(wsSummary.Rows.Count, tempColOffset).End(xlUp).Row + 1
-                wsTemp.Range("A2:A" & lastRowTemp).Copy
-                wsSummary.Cells(nextSummaryRow, tempColOffset).PasteSpecial xlPasteValuesAndNumberFormats
-                Application.CutCopyMode = False
-            End If
+            CopyCleanedDataToSummary wsTemp, wsSummary, tempColOffset
         End If
 
 NextKey:
+        ' Clear temporary data after each key to free memory
+        wsTemp.Cells.ClearContents
+        Set findRange = Nothing
+        Set dataRange = Nothing
+        
     Next colCounter
 
 CleanUp:
+    ' Close source workbook immediately after processing
     If Not wbSource Is Nothing Then
         wbSource.Close SaveChanges:=False
         Set wbSource = Nothing
         Set wsSource = Nothing
     End If
     
-    ' Force garbage collection
-    DoEvents
+    ' Force memory cleanup
+    ForceMemoryCleanup
     Exit Sub
 
 ErrorHandler:
-    ' Silent error handling for individual files - continue processing other files
+    ' Continue processing other files even if one fails
     Resume CleanUp
 
+End Sub
+
+'==================================================================================================
+' Enhanced file opening with Protected View handling
+'==================================================================================================
+Function OpenFileWithFallback(ByVal fullPath As String) As Workbook
+    Dim wb As Workbook
+    
+    On Error Resume Next
+    
+    ' Method 1: Standard opening with Protected View handling
+    Set wb = Application.Workbooks.Open( _
+        Filename:=fullPath, _
+        ReadOnly:=True, _
+        UpdateLinks:=False, _
+        AddToMru:=False, _
+        IgnoreReadOnlyRecommended:=True, _
+        CorruptLoad:=xlExtractData _
+    )
+    
+    ' Handle Protected View
+    If Not wb Is Nothing Then
+        If Not wb.ProtectedViewWindow Is Nothing Then
+            wb.ProtectedViewWindow.Edit
+            DoEvents
+        End If
+        Set OpenFileWithFallback = wb
+        Exit Function
+    End If
+    
+    ' Method 2: Try with different parameters if first method fails
+    Set wb = Application.Workbooks.Open( _
+        Filename:=fullPath, _
+        ReadOnly:=True, _
+        UpdateLinks:=False _
+    )
+    
+    If Not wb Is Nothing Then
+        Set OpenFileWithFallback = wb
+        Exit Function
+    End If
+    
+    ' Method 3: Try basic open as last resort
+    Set wb = Application.Workbooks.Open(fullPath)
+    Set OpenFileWithFallback = wb
+    
+End Function
+
+'==================================================================================================
+' Efficient in-place data cleaning
+'==================================================================================================
+Sub CleanDataInPlace(ByVal wsTemp As Worksheet, ByVal searchKey As String)
+    Dim lastRow As Long
+    Dim i As Long
+    Dim cellValue As String
+    
+    lastRow = wsTemp.Cells(wsTemp.Rows.Count, 1).End(xlUp).Row
+    
+    If lastRow >= 2 Then
+        ' Process from bottom to top when deleting rows
+        For i = lastRow To 2 Step -1
+            cellValue = Trim(CStr(wsTemp.Cells(i, 1).Value))
+            
+            ' Remove empty cells, duplicate headers, and specific unwanted content
+            If cellValue = "" Or _
+               cellValue = CStr(searchKey) Or _
+               (CStr(searchKey) = "Submission Date" And InStr(1, cellValue, "Submission Count", vbTextCompare) > 0) Then
+                wsTemp.Rows(i).Delete
+            End If
+        Next i
+    End If
+End Sub
+
+'==================================================================================================
+' Efficient copying of cleaned data to summary sheet
+'==================================================================================================
+Sub CopyCleanedDataToSummary(ByVal wsTemp As Worksheet, ByVal wsSummary As Worksheet, ByVal targetColumn As Integer)
+    Dim lastRowTemp As Long
+    Dim nextSummaryRow As Long
+    Dim sourceRange As Range
+    
+    lastRowTemp = wsTemp.Cells(wsTemp.Rows.Count, 1).End(xlUp).Row
+    
+    If lastRowTemp >= 2 Then
+        ' Find next available row in summary sheet
+        nextSummaryRow = wsSummary.Cells(wsSummary.Rows.Count, targetColumn).End(xlUp).Row + 1
+        
+        ' Ensure we don't overwrite headers
+        If nextSummaryRow = 1 Then nextSummaryRow = 2
+        
+        ' Copy data efficiently using Value property (faster than copy/paste)
+        Set sourceRange = wsTemp.Range("A2:A" & lastRowTemp)
+        wsSummary.Range(wsSummary.Cells(nextSummaryRow, targetColumn), _
+                       wsSummary.Cells(nextSummaryRow + sourceRange.Rows.Count - 1, targetColumn)).Value = sourceRange.Value
+    End If
+End Sub
+
+'==================================================================================================
+' Aggressive memory cleanup
+'==================================================================================================
+Sub ForceMemoryCleanup()
+    ' Clear clipboard
+    Application.CutCopyMode = False
+    
+    ' Force Excel to process pending events
+    DoEvents
+    
+    ' Additional cleanup commands
+    Application.DisplayAlerts = False
+    Application.DisplayAlerts = True
 End Sub
