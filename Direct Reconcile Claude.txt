@@ -1,22 +1,22 @@
 Option Explicit
 
 '==================================================================================================
-' 全局变量用于统计
+' Global variables for statistics
 '==================================================================================================
 Private g_TotalXlsFiles As Long
 Private g_TotalACTFolders As Long
 
 '==================================================================================================
-' 主程序：遍历所有符合条件的文件夹和文件
-' 增加了文件和文件夹统计功能，改进了内存管理
+' Main Procedure: Enhanced version with statistics and memory optimization
+' Can be run directly - all dependencies included
 '==================================================================================================
 Sub Main_ProcessAllFiles()
 
-    ' --- 配置部分 ---
+    ' --- Configuration Section ---
     Const ROOT_FOLDER_NAME As String = "DirectSale Reconcile Inputs"
     Const FOLDER_KEYWORD As String = "ACT"
     Const FILE_KEYWORD As String = "ACT"
-    ' --- 配置结束 ---
+    ' --- End Configuration Section ---
 
     Dim fso As Object
     Dim rootFolder As Object
@@ -26,7 +26,7 @@ Sub Main_ProcessAllFiles()
     Dim wsSummary As Worksheet
     Dim wsTemp As Worksheet
 
-    ' 初始化统计变量
+    ' Initialize statistics
     g_TotalXlsFiles = 0
     g_TotalACTFolders = 0
 
@@ -34,11 +34,11 @@ Sub Main_ProcessAllFiles()
     basePath = ThisWorkbook.Path & "\" & ROOT_FOLDER_NAME
 
     If Not fso.FolderExists(basePath) Then
-        MsgBox "错误：找不到数据源文件夹 '" & basePath & "'", vbCritical, "文件夹未找到"
+        MsgBox "Error: Data source folder '" & basePath & "' not found.", vbCritical, "Folder Not Found"
         Exit Sub
     End If
 
-    ' 优化性能设置
+    ' Optimize performance
     Application.ScreenUpdating = False
     Application.DisplayAlerts = False
     Application.EnableEvents = False
@@ -46,52 +46,54 @@ Sub Main_ProcessAllFiles()
 
     On Error GoTo ErrorHandler
 
-    ' 准备工作表
+    ' Setup worksheets
     SetupSheets wsSummary, wsTemp
 
     Set rootFolder = fso.GetFolder(basePath)
 
-    ' 遍历所有子文件夹
+    ' Loop through subfolders
     For Each subFolder In rootFolder.SubFolders
         If InStr(1, subFolder.Name, FOLDER_KEYWORD, vbTextCompare) > 0 Then
             g_TotalACTFolders = g_TotalACTFolders + 1
             
-            ' 遍历文件夹中的所有文件
+            ' Loop through files in subfolder
             For Each fileItem In subFolder.Files
                 If InStr(1, fileItem.Name, FILE_KEYWORD, vbTextCompare) > 0 And _
                    LCase(fso.GetExtensionName(fileItem.Name)) = "xls" Then
                     g_TotalXlsFiles = g_TotalXlsFiles + 1
                     
-                    ' 处理单个文件（使用改进的内存管理）
-                    ProcessSingleFileOptimized fileItem.Path, wsSummary, wsTemp
+                    ' Process single file with enhanced error handling
+                    ProcessSingleFileEnhanced fileItem.Path, wsSummary, wsTemp
                     
-                    ' 强制垃圾回收以释放内存
+                    ' Force memory cleanup
                     DoEvents
+                    Application.CutCopyMode = False
                 End If
             Next fileItem
         End If
     Next subFolder
 
-    ' 在A1单元格写入统计信息
+    ' Write statistics to A1 cell of current worksheet
     With ThisWorkbook.ActiveSheet
-        .Cells(1, 1).Value = "统计：处理了 " & g_TotalXlsFiles & " 个XLS文件，来自 " & g_TotalACTFolders & " 个ACT文件夹"
+        .Cells(1, 1).Value = "Statistics: Processed " & g_TotalXlsFiles & " XLS files from " & g_TotalACTFolders & " ACT folders"
         .Cells(1, 1).Font.Bold = True
-        .Cells(1, 1).Interior.Color = RGB(255, 255, 0) ' 黄色背景
+        .Cells(1, 1).Interior.Color = RGB(255, 255, 0) ' Yellow background
+        .Columns("A:A").AutoFit
     End With
 
-    MsgBox "所有数据处理完成！" & vbCrLf & _
-           "处理了 " & g_TotalXlsFiles & " 个XLS文件" & vbCrLf & _
-           "来自 " & g_TotalACTFolders & " 个ACT文件夹" & vbCrLf & _
-           "请检查'Summary Sheet'。", vbInformation, "处理完成"
+    MsgBox "All data processing complete!" & vbCrLf & _
+           "Processed " & g_TotalXlsFiles & " XLS files" & vbCrLf & _
+           "from " & g_TotalACTFolders & " ACT folders" & vbCrLf & _
+           "Please check 'Summary Sheet'.", vbInformation, "Processing Complete"
 
 CleanUp:
-    ' 恢复Excel设置
+    ' Restore Excel settings
     Application.ScreenUpdating = True
     Application.DisplayAlerts = True
     Application.EnableEvents = True
     Application.Calculation = xlCalculationAutomatic
     
-    ' 清理对象
+    ' Clean up objects
     Set fso = Nothing
     Set rootFolder = Nothing
     Set subFolder = Nothing
@@ -99,18 +101,18 @@ CleanUp:
     Exit Sub
 
 ErrorHandler:
-    MsgBox "主程序发生错误：" & Err.Description, vbCritical, "错误"
+    MsgBox "Error in main procedure: " & Err.Description, vbCritical, "Error"
     Resume CleanUp
 
 End Sub
 
 '==================================================================================================
-' 辅助程序1：准备工作表
+' Helper Procedure: Setup worksheets
 '==================================================================================================
 Sub SetupSheets(ByRef wsSummary As Worksheet, ByRef wsTemp As Worksheet)
     On Error Resume Next
     
-    ' 设置临时工作表
+    ' Setup temporary worksheet
     Set wsTemp = ThisWorkbook.Sheets("Intermediate Sheet")
     If wsTemp Is Nothing Then
         Set wsTemp = ThisWorkbook.Sheets.Add(After:=ThisWorkbook.Sheets(ThisWorkbook.Sheets.Count))
@@ -118,7 +120,7 @@ Sub SetupSheets(ByRef wsSummary As Worksheet, ByRef wsTemp As Worksheet)
     End If
     wsTemp.Cells.Clear
 
-    ' 设置汇总工作表
+    ' Setup summary worksheet
     Set wsSummary = ThisWorkbook.Sheets("Summary Sheet")
     If wsSummary Is Nothing Then
         Set wsSummary = ThisWorkbook.Sheets.Add(After:=ThisWorkbook.Sheets(ThisWorkbook.Sheets.Count))
@@ -127,36 +129,37 @@ Sub SetupSheets(ByRef wsSummary As Worksheet, ByRef wsTemp As Worksheet)
     wsSummary.Cells.Clear
     On Error GoTo 0
 
-    ' 创建标题行
+    ' Create header row
     With wsSummary
         .Cells(1, 1).Value = "Submission Date"
         .Cells(1, 2).Value = "Account #"
         .Cells(1, 3).Value = "Expire Date"
         .Cells(1, 4).Value = "Amount"
-        ' 格式化标题行
+        ' Format header row
         .Range("A1:D1").Font.Bold = True
         .Range("A1:D1").Interior.Color = RGB(200, 200, 200)
     End With
 End Sub
 
 '==================================================================================================
-' 优化版本：使用ADO连接处理Excel文件，避免完全打开工作簿
-' 解决Protected View和内存问题
+' Enhanced file processing with multiple fallback methods
 '==================================================================================================
-Sub ProcessSingleFileOptimized(ByVal fullPath As String, ByVal wsSummary As Worksheet, ByVal wsTemp As Worksheet)
+Sub ProcessSingleFileEnhanced(ByVal fullPath As String, ByVal wsSummary As Worksheet, ByVal wsTemp As Worksheet)
     
-    ' 首先尝试使用ADO方式（不打开文件）
+    On Error Resume Next
+    
+    ' Method 1: Try ADO connection (fastest, no file opening, bypasses Protected View)
     If ProcessFileWithADO(fullPath, wsSummary, wsTemp) Then
-        Exit Sub ' ADO成功则退出
+        Exit Sub
     End If
     
-    ' 如果ADO失败，尝试传统方式但增加错误处理
+    ' Method 2: Try traditional opening with Protected View handling
     ProcessSingleFileTraditional fullPath, wsSummary, wsTemp
     
 End Sub
 
 '==================================================================================================
-' 使用ADO连接读取Excel文件（不打开工作簿，解决Protected View问题）
+' Method 1: ADO Connection (No file opening, solves Protected View and memory issues)
 '==================================================================================================
 Function ProcessFileWithADO(ByVal fullPath As String, ByVal wsSummary As Worksheet, ByVal wsTemp As Worksheet) As Boolean
     
@@ -164,34 +167,38 @@ Function ProcessFileWithADO(ByVal fullPath As String, ByVal wsSummary As Workshe
     Dim rs As Object
     Dim sql As String
     Dim connectionString As String
-    Dim sheetName As String
+    Dim worksheetName As String
     
-    On Error GoTo ADOError
+    On Error GoTo ADOCleanup
     
-    ' 创建ADO连接
+    ' Create ADO objects
     Set conn = CreateObject("ADODB.Connection")
     Set rs = CreateObject("ADODB.Recordset")
     
-    ' 构建连接字符串
+    ' Build connection string for Excel files
     connectionString = "Provider=Microsoft.ACE.OLEDB.12.0;" & _
                       "Data Source=" & fullPath & ";" & _
                       "Extended Properties=""Excel 8.0;HDR=Yes;IMEX=1;"";"
     
+    ' Try to open connection
     conn.Open connectionString
     
-    ' 获取第一个工作表名称
-    Set rs = conn.OpenSchema(20) ' adSchemaTables = 20
+    ' Get first worksheet name
+    Set rs = conn.OpenSchema(20) ' 20 = adSchemaTables
     If Not rs.EOF Then
-        sheetName = rs.Fields("TABLE_NAME").Value
-        sheetName = Replace(sheetName, "$", "") ' 移除$符号
+        worksheetName = rs.Fields("TABLE_NAME").Value
+        ' Remove $ suffix if present
+        If Right(worksheetName, 1) = "$" Then
+            worksheetName = Left(worksheetName, Len(worksheetName) - 1)
+        End If
     Else
-        GoTo ADOError
+        GoTo ADOCleanup
     End If
     rs.Close
     
-    ' 定义要查找的列
-    Dim searchKeys As Variant
-    searchKeys = Array( _
+    ' Define columns to search for
+    Dim searchColumns As Variant
+    searchColumns = Array( _
         Array("Submission Date", 1), _
         Array("Account #", 2), _
         Array("Expire Date", 3), _
@@ -199,37 +206,39 @@ Function ProcessFileWithADO(ByVal fullPath As String, ByVal wsSummary As Workshe
     )
     
     Dim i As Integer
-    Dim nextSummaryRow As Long
+    Dim nextRow As Long
     Dim colName As String
+    Dim targetCol As Integer
     
-    ' 处理每个需要的列
-    For i = LBound(searchKeys) To UBound(searchKeys)
-        colName = searchKeys(i)(0)
+    ' Process each required column
+    For i = LBound(searchColumns) To UBound(searchColumns)
+        colName = searchColumns(i)(0)
+        targetCol = searchColumns(i)(1)
         
-        ' 构建SQL查询
-        sql = "SELECT [" & colName & "] FROM [" & sheetName & "$] WHERE [" & colName & "] IS NOT NULL"
+        ' Build SQL query
+        sql = "SELECT [" & colName & "] FROM [" & worksheetName & "$] WHERE [" & colName & "] IS NOT NULL AND [" & colName & "] <> ''"
         
         On Error Resume Next
         Set rs = CreateObject("ADODB.Recordset")
         rs.Open sql, conn, 1, 1 ' adOpenKeyset, adLockReadOnly
         
         If Err.Number = 0 And Not rs.EOF Then
-            ' 找到下一个空行
-            nextSummaryRow = wsSummary.Cells(wsSummary.Rows.Count, searchKeys(i)(1)).End(xlUp).Row + 1
+            ' Find next empty row in summary sheet
+            nextRow = wsSummary.Cells(wsSummary.Rows.Count, targetCol).End(xlUp).Row + 1
             
-            ' 复制数据
-            Dim rowCounter As Long
-            rowCounter = nextSummaryRow
+            ' Skip header if we're starting from row 1
+            If nextRow = 1 Then nextRow = 2
             
+            ' Copy data row by row
             Do While Not rs.EOF
                 Dim cellValue As String
-                cellValue = Trim(CStr(rs.Fields(0).Value))
+                cellValue = Trim(CStr(rs.Fields(0).Value & ""))
                 
-                ' 过滤无效数据
+                ' Filter out invalid data
                 If cellValue <> "" And cellValue <> colName And _
                    Not (colName = "Submission Date" And InStr(1, cellValue, "Submission Count", vbTextCompare) > 0) Then
-                    wsSummary.Cells(rowCounter, searchKeys(i)(1)).Value = rs.Fields(0).Value
-                    rowCounter = rowCounter + 1
+                    wsSummary.Cells(nextRow, targetCol).Value = rs.Fields(0).Value
+                    nextRow = nextRow + 1
                 End If
                 
                 rs.MoveNext
@@ -237,29 +246,33 @@ Function ProcessFileWithADO(ByVal fullPath As String, ByVal wsSummary As Workshe
             
             rs.Close
         End If
-        On Error GoTo ADOError
+        On Error GoTo ADOCleanup
         
+        Set rs = Nothing
     Next i
     
     conn.Close
-    Set rs = Nothing
     Set conn = Nothing
     
     ProcessFileWithADO = True
     Exit Function
     
-ADOError:
+ADOCleanup:
     On Error Resume Next
-    If Not rs Is Nothing Then rs.Close
-    If Not conn Is Nothing Then conn.Close
-    Set rs = Nothing
-    Set conn = Nothing
+    If Not rs Is Nothing Then
+        rs.Close
+        Set rs = Nothing
+    End If
+    If Not conn Is Nothing Then
+        conn.Close
+        Set conn = Nothing
+    End If
     ProcessFileWithADO = False
 
 End Function
 
 '==================================================================================================
-' 传统方式处理文件（改进版，增加Protected View处理）
+' Method 2: Traditional file opening with Protected View handling
 '==================================================================================================
 Sub ProcessSingleFileTraditional(ByVal fullPath As String, ByVal wsSummary As Worksheet, ByVal wsTemp As Worksheet)
 
@@ -286,24 +299,27 @@ Sub ProcessSingleFileTraditional(ByVal fullPath As String, ByVal wsSummary As Wo
 
     On Error GoTo ErrorHandler
 
-    ' 尝试以只读和非Protected View方式打开
-    Set wbSource = Application.Workbooks.Open(Filename:=fullPath, _
-                                             ReadOnly:=True, _
-                                             UpdateLinks:=False, _
-                                             AddToMru:=False, _
-                                             IgnoreReadOnlyRecommended:=True)
+    ' Try to open file with multiple parameters to avoid Protected View
+    Set wbSource = Application.Workbooks.Open( _
+        Filename:=fullPath, _
+        ReadOnly:=True, _
+        UpdateLinks:=False, _
+        AddToMru:=False, _
+        IgnoreReadOnlyRecommended:=True, _
+        CorruptLoad:=xlExtractData _
+    )
 
-    ' 如果打开的是Protected View，尝试启用编辑
-    If wbSource.ProtectedViewWindow Is Nothing Then
-        Set wsSource = wbSource.Sheets(1)
-    Else
-        ' 处理Protected View
+    ' Handle Protected View if present
+    On Error Resume Next
+    If Not wbSource.ProtectedViewWindow Is Nothing Then
         wbSource.ProtectedViewWindow.Edit
-        DoEvents ' 等待编辑模式启用
-        Set wsSource = wbSource.Sheets(1)
+        DoEvents ' Wait for edit mode to enable
     End If
+    On Error GoTo ErrorHandler
 
-    ' 处理每个关键字
+    Set wsSource = wbSource.Sheets(1)
+
+    ' Process each search key
     For colCounter = LBound(searchKeys) To UBound(searchKeys)
         searchKey = searchKeys(colCounter)(0)
         tempColOffset = searchKeys(colCounter)(1)
@@ -311,7 +327,12 @@ Sub ProcessSingleFileTraditional(ByVal fullPath As String, ByVal wsSummary As Wo
 
         wsTemp.Cells.ClearContents
 
-        Set findRange = wsSource.Cells.Find(What:=searchKey, LookIn:=xlValues, LookAt:=xlWhole, MatchCase:=False)
+        Set findRange = wsSource.Cells.Find( _
+            What:=searchKey, _
+            LookIn:=xlValues, _
+            LookAt:=xlWhole, _
+            MatchCase:=False _
+        )
 
         If Not findRange Is Nothing Then
             If copyCurrentColumn Then
@@ -324,18 +345,21 @@ Sub ProcessSingleFileTraditional(ByVal fullPath As String, ByVal wsSummary As Wo
             lastRowSource = wsSource.Cells(wsSource.Rows.Count, targetColumnSource).End(xlUp).Row
             If lastRowSource <= findRange.Row Then GoTo NextKey
 
-            ' 复制数据到临时工作表
-            wsSource.Range(wsSource.Cells(findRange.Row + 1, targetColumnSource), _
-                          wsSource.Cells(lastRowSource, targetColumnSource)).Copy
+            ' Copy data to temporary worksheet
+            wsSource.Range( _
+                wsSource.Cells(findRange.Row + 1, targetColumnSource), _
+                wsSource.Cells(lastRowSource, targetColumnSource) _
+            ).Copy
+            
             wsTemp.Cells(2, 1).PasteSpecial xlPasteValuesAndNumberFormats
             Application.CutCopyMode = False
 
-            ' 数据清理
+            ' Clean data (remove empty rows and duplicate headers)
             lastRowTemp = wsTemp.Cells(wsTemp.Rows.Count, 1).End(xlUp).Row
             If lastRowTemp >= 2 Then
                 For i = lastRowTemp To 2 Step -1
                     Dim cellValue As String
-                    cellValue = Trim(wsTemp.Cells(i, 1).Value)
+                    cellValue = Trim(wsTemp.Cells(i, 1).Value & "")
                     If cellValue = "" Or cellValue = CStr(searchKey) Or _
                        (CStr(searchKey) = "Submission Date" And InStr(1, cellValue, "Submission Count", vbTextCompare) > 0) Then
                         wsTemp.Rows(i).Delete
@@ -343,7 +367,7 @@ Sub ProcessSingleFileTraditional(ByVal fullPath As String, ByVal wsSummary As Wo
                 Next i
             End If
 
-            ' 复制清理后的数据到汇总表
+            ' Copy cleaned data to summary sheet
             lastRowTemp = wsTemp.Cells(wsTemp.Rows.Count, 1).End(xlUp).Row
             If lastRowTemp >= 2 Then
                 nextSummaryRow = wsSummary.Cells(wsSummary.Rows.Count, tempColOffset).End(xlUp).Row + 1
@@ -363,21 +387,12 @@ CleanUp:
         Set wsSource = Nothing
     End If
     
-    ' 强制垃圾回收
+    ' Force garbage collection
     DoEvents
     Exit Sub
 
 ErrorHandler:
-    MsgBox "处理文件时发生错误 '" & fullPath & "':" & vbCrLf & Err.Description, vbExclamation, "文件处理错误"
+    ' Silent error handling for individual files - continue processing other files
     Resume CleanUp
 
-End Sub
-
-'==================================================================================================
-' 内存清理辅助程序
-'==================================================================================================
-Sub ForceMemoryCleanup()
-    DoEvents
-    Application.CutCopyMode = False
-    ' 可以添加其他内存清理操作
 End Sub
