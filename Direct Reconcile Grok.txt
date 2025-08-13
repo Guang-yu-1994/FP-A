@@ -189,3 +189,80 @@ Sub ProcessSingleFile(ByVal fullPath As String, ByVal wsSummary As Worksheet, By
         Set rs = Nothing
         Set conn = Nothing
     Else
+        ' Original method with open, but with security adjustment for Protected View
+        Application.AutomationSecurity = msoAutomationSecurityLow ' <--- Temp low security for Protected View (point 2)
+        
+        ' Open the source workbook
+        Set wbSource = Workbooks.Open(fullPath, ReadOnly:=True)
+        Set wsSource = wbSource.Sheets(1)
+
+        ' Loop through each keyword to be found
+        For colCounter = LBound(searchKeys) To UBound(searchKeys)
+            searchKey = searchKeys(colCounter)(0)
+            tempColOffset = searchKeys(colCounter)(1)
+            copyCurrentColumn = searchKeys(colCounter)(2)
+
+            wsTemp.Cells.ClearContents ' Clear the temporary worksheet before each loop
+
+            Set findRange = wsSource.Cells.Find(What:=searchKey, LookIn:=xlValues, LookAt:=xlWhole, MatchCase:=False)
+
+            If Not findRange Is Nothing Then
+                If copyCurrentColumn Then
+                    targetColumnSource = findRange.Column
+                Else
+                    targetColumnSource = findRange.Column - 1
+                    If targetColumnSource < 1 Then GoTo NextKey ' If in column A, cannot get the column to the left, so skip this key
+                End If
+
+                lastRowSource = wsSource.Cells(wsSource.Rows.Count, targetColumnSource).End(xlUp).Row
+                If lastRowSource <= findRange.Row Then GoTo NextKey ' If there is no data below the header row, skip
+
+                ' Copy data to the temporary worksheet
+                wsSource.Range(wsSource.Cells(findRange.Row + 1, targetColumnSource), wsSource.Cells(lastRowSource, targetColumnSource)).Copy
+                wsTemp.Cells(2, 1).PasteSpecial xlPasteValuesAndNumberFormats
+                Application.CutCopyMode = False
+
+                ' --- Data Cleaning Logic (Loop Deletion) ---
+                lastRowTemp = wsTemp.Cells(wsTemp.Rows.Count, 1).End(xlUp).Row
+                If lastRowTemp >= 2 Then
+                    For i = lastRowTemp To 2 Step -1
+                        Dim cellValue As String
+                        cellValue = Trim(wsTemp.Cells(i, 1).Value)
+                        If cellValue = "" Or cellValue = CStr(searchKey) Or (CStr(searchKey) = "Submission Date" And InStr(1, cellValue, "Submission Count", vbTextCompare) > 0) Then
+                            wsTemp.Rows(i).Delete
+                        End If
+                    Next i
+                End If
+                ' --- End Data Cleaning ---
+
+                ' Copy the cleaned data to the summary sheet (start from row 3 to avoid headers)
+                lastRowTemp = wsTemp.Cells(wsTemp.Rows.Count, 1).End(xlUp).Row
+                If lastRowTemp >= 2 Then
+                    ' Key Step: Find the next empty row in the summary sheet to append data
+                    nextSummaryRow = wsSummary.Cells(wsSummary.Rows.Count, tempColOffset).End(xlUp).Row + 1
+                    wsTemp.Range("A2:A" & lastRowTemp).Copy
+                    wsSummary.Cells(nextSummaryRow, tempColOffset).PasteSpecial xlPasteValuesAndNumberFormats
+                    Application.CutCopyMode = False
+                End If
+            End If
+
+NextKey:
+        Next colCounter
+        
+        Application.AutomationSecurity = msoAutomationSecurityByUI ' <--- Restore security
+    End If
+
+CleanUp:
+    If Not wbSource Is Nothing Then
+        wbSource.Close SaveChanges:=False
+        Set wbSource = Nothing
+        Set wsSource = Nothing
+    End If
+    Set findRange = Nothing
+    DoEvents ' <--- Force memory release (point 3)
+    Exit Sub
+
+ErrorHandler:
+    MsgBox "An error occurred while processing the file '" & fullPath & "':" & vbCrLf & Err.Description, vbExclamation, "File Processing Error"
+    Resume CleanUp
+End Sub
