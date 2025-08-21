@@ -1,52 +1,15 @@
+
 Option Explicit
 
 '==================================================================================================
-' Simple test version to isolate issues
-'==================================================================================================
-Sub Test_BasicSetup()
-    Dim wsSummary As Worksheet
-    Dim wsTemp As Worksheet
-    
-    Application.ScreenUpdating = False
-    Application.DisplayAlerts = False
-    
-    On Error GoTo TestError
-    
-    ' Test worksheet setup
-    MsgBox "Testing worksheet setup...", vbInformation, "Test"
-    SetupWorksheets wsSummary, wsTemp
-    
-    ' Test basic operations
-    MsgBox "Testing basic operations...", vbInformation, "Test"
-    wsSummary.Cells(2, 1).Value = "Test"
-    wsTemp.Cells(1, 1).Value = "Test"
-    
-    ' Test logging
-    MsgBox "Testing logging...", vbInformation, "Test"
-    g_LogNextRow = 2
-    LogFileProcessToSheet1 "Test.xlsx", "TestFolder", 1.5
-    
-    MsgBox "All tests passed successfully!", vbInformation, "Test Complete"
-    GoTo TestCleanup
-    
-TestError:
-    MsgBox "Test failed at: " & Err.Description & vbCrLf & "Error: " & Err.Number, vbCritical, "Test Error"
-    
-TestCleanup:
-    Application.ScreenUpdating = True
-    Application.DisplayAlerts = True
-End Sub
-
-'==================================================================================================
-' Global variables for statistics and debugging
+' Global variables for statistics
 '==================================================================================================
 Private g_TotalXlsFiles As Long
 Private g_TotalACTFolders As Long
-Private g_LogNextRow As Long
-Private g_DebugMode As Boolean ' New: Enable detailed debug logging
+Private g_LogNextRow As Long ' New: To track the next row for logging in Sheet1
 
 '==================================================================================================
-' Main Procedure: Enhanced with Source Folder tracking and performance optimizations
+' Main Procedure: Keep original efficient logic, fix file reading issues
 '==================================================================================================
 Sub Main_ProcessAllFiles()
 
@@ -55,7 +18,6 @@ Sub Main_ProcessAllFiles()
     Const OUTPUT_FOLDER_NAME As String = "DirectSale Reconcile Outputs"
     Const FOLDER_KEYWORD As String = "ACT"
     Const FILE_KEYWORD As String = "ACT"
-    g_DebugMode = True ' Set to False to reduce logging overhead
     ' --- End Configuration Section ---
 
     Dim fso As Object
@@ -66,15 +28,15 @@ Sub Main_ProcessAllFiles()
     Dim outputPath As String
     Dim wsSummary As Worksheet
     Dim wsTemp As Worksheet
-    Dim startTime As Double
-    Dim endTime As Double
-    Dim totalStartTime As Double
+    Dim startTime As Double ' New: To record processing start time
+    Dim endTime As Double   ' New: To record processing end time
 
     ' Initialize statistics
     g_TotalXlsFiles = 0
     g_TotalACTFolders = 0
+    
+    ' New: Initialize the log row for Sheet1 (starting from row 2, as row 1 is for general stats)
     g_LogNextRow = 2
-    totalStartTime = Timer
 
     Set fso = CreateObject("Scripting.FileSystemObject")
     basePath = ThisWorkbook.Path & "\" & ROOT_FOLDER_NAME
@@ -91,32 +53,15 @@ Sub Main_ProcessAllFiles()
         fso.CreateFolder outputPath
     End If
 
-    ' Performance optimizations
     Application.ScreenUpdating = False
     Application.DisplayAlerts = False
     Application.EnableEvents = False
     Application.Calculation = xlCalculationManual
-    Application.StatusBar = "Processing files..."
 
     On Error GoTo ErrorHandler
 
     ' Setup worksheets
-    On Error Resume Next
     SetupWorksheets wsSummary, wsTemp
-    If Err.Number <> 0 Then
-        MsgBox "Error setting up worksheets: " & Err.Description, vbCritical, "Setup Error"
-        GoTo CleanUp
-    End If
-    On Error GoTo ErrorHandler
-    
-    ' Initialize debug logging
-    On Error Resume Next
-    InitializeDebugLog
-    If Err.Number <> 0 Then
-        g_DebugMode = False ' Disable debug mode if it fails
-        MsgBox "Warning: Debug logging disabled due to error: " & Err.Description, vbExclamation, "Debug Warning"
-    End If
-    On Error GoTo ErrorHandler
 
     Set rootFolder = fso.GetFolder(basePath)
 
@@ -125,8 +70,6 @@ Sub Main_ProcessAllFiles()
         If InStr(1, subFolder.Name, FOLDER_KEYWORD, vbTextCompare) > 0 Then
             g_TotalACTFolders = g_TotalACTFolders + 1
             
-            LogDebug "Processing folder: " & subFolder.Name & " (Folder " & g_TotalACTFolders & ")"
-            
             ' Loop through files in subfolder
             For Each fileItem In subFolder.Files
                 If InStr(1, fileItem.Name, FILE_KEYWORD, vbTextCompare) > 0 And _
@@ -134,56 +77,34 @@ Sub Main_ProcessAllFiles()
                     LCase(fso.GetExtensionName(fileItem.Name)) = "xlsx") Then
                     
                     g_TotalXlsFiles = g_TotalXlsFiles + 1
-                    Application.StatusBar = "Processing file " & g_TotalXlsFiles & ": " & fileItem.Name
                     
-                    startTime = Timer
-                    LogDebug "Starting file: " & fileItem.Name & " (Size: " & Format(fileItem.Size / 1024, "0.0") & " KB)"
+                    startTime = Timer ' Record start time
 
-                    ' Process single file with source folder information
-                    ProcessSingleFile fileItem.Path, wsSummary, wsTemp, fileItem.Name, subFolder.Name
+                    ' Process single file - keep original efficient logic
+                    ' Pass the file name to ProcessSingleFile for logging
+                    ProcessSingleFile fileItem.Path, wsSummary, wsTemp, fileItem.Name
                     
-                    endTime = Timer
-                    Dim processTime As Double
-                    processTime = endTime - startTime
+                    endTime = Timer ' Record end time
                     
-                    ' Log file processing details
-                    LogFileProcessToSheet1 fileItem.Name, subFolder.Name, processTime
-                    LogDebug "Completed file: " & fileItem.Name & " (Time: " & Format(processTime, "0.00") & "s)"
+                    ' Log file name and processing time to Sheet1
+                    LogFileProcessToSheet1 fileItem.Name, endTime - startTime
                     
-                    ' Memory cleanup every 10 files
-                    If g_TotalXlsFiles Mod 10 = 0 Then
-                        DoEvents
-                        LogDebug "Memory cleanup checkpoint - Files processed: " & g_TotalXlsFiles
-                    End If
+                    ' Memory cleanup
+                    DoEvents
                 End If
             Next fileItem
         End If
     Next subFolder
 
-    ' Write final statistics
-    On Error Resume Next
-    WriteStatisticsToSheet1 Timer - totalStartTime
-    If Err.Number <> 0 Then
-        MsgBox "Warning: Could not write statistics: " & Err.Description, vbExclamation, "Statistics Warning"
-    End If
-    On Error GoTo ErrorHandler
+    ' Write general statistics to Sheet1 A1 cell
+    WriteStatisticsToSheet1
 
     ' Save Summary Sheet as separate workbook
-    On Error Resume Next
     SaveSummaryToOutputFolder wsSummary, outputPath
-    If Err.Number <> 0 Then
-        MsgBox "Warning: Could not save summary file: " & Err.Description, vbExclamation, "Save Warning"
-    End If
-    On Error GoTo ErrorHandler
-    
-    On Error Resume Next
-    LogDebug "Total processing time: " & Format(Timer - totalStartTime, "0.00") & " seconds"
-    On Error GoTo ErrorHandler
 
     MsgBox "All data processing complete!" & vbCrLf & _
            "Processed " & g_TotalXlsFiles & " XLS files" & vbCrLf & _
            "from " & g_TotalACTFolders & " ACT folders" & vbCrLf & _
-           "Total time: " & Format(Timer - totalStartTime, "0.0") & " seconds" & vbCrLf & _
            "Summary saved to: " & outputPath, vbInformation, "Processing Complete"
 
 CleanUp:
@@ -191,7 +112,6 @@ CleanUp:
     Application.DisplayAlerts = True
     Application.EnableEvents = True
     Application.Calculation = xlCalculationAutomatic
-    Application.StatusBar = False
     
     Set fso = Nothing
     Set rootFolder = Nothing
@@ -202,20 +122,15 @@ CleanUp:
     Exit Sub
 
 ErrorHandler:
-    On Error Resume Next
-    If g_DebugMode Then
-        LogDebug "CRITICAL ERROR in main procedure: " & Err.Description & " (Error " & Err.Number & ")"
-    End If
-    On Error GoTo 0
-    MsgBox "Error in main procedure: " & Err.Description & vbCrLf & "Error Number: " & Err.Number, vbCritical, "Error"
+    MsgBox "Error in main procedure: " & Err.Description, vbCritical, "Error"
     Resume CleanUp
 
 End Sub
 
 '==================================================================================================
-' Enhanced statistics with total processing time
+' Write general statistics to Sheet1 A1 cell
 '==================================================================================================
-Sub WriteStatisticsToSheet1(ByVal totalTime As Double)
+Sub WriteStatisticsToSheet1()
     Dim ws1 As Worksheet
     
     On Error Resume Next
@@ -227,147 +142,80 @@ Sub WriteStatisticsToSheet1(ByVal totalTime As Double)
     
     If Not ws1 Is Nothing Then
         With ws1
-            .Cells(1, 1).Value = "Statistics: Processed " & g_TotalXlsFiles & " XLS files from " & g_TotalACTFolders & " ACT folders (Total time: " & Format(totalTime, "0.0") & "s)"
+            .Cells(1, 1).Value = "Statistics: Processed " & g_TotalXlsFiles & " XLS files from " & g_TotalACTFolders & " ACT folders"
             .Cells(1, 1).Font.Bold = True
             .Cells(1, 1).Interior.Color = RGB(255, 255, 0)
-            .Columns("A:D").AutoFit ' Updated to include new column
+            .Columns("A:A").AutoFit
         End With
     End If
 End Sub
 
 '==================================================================================================
-' Enhanced logging with Source Folder information
+' New: Log file processing details to Sheet1
 '==================================================================================================
-Sub LogFileProcessToSheet1(ByVal fileName As String, ByVal sourceFolder As String, ByVal processTime As Double)
+Sub LogFileProcessToSheet1(ByVal fileName As String, ByVal processTime As Double)
     Dim ws1 As Worksheet
-    Dim ws As Worksheet
     
-    On Error GoTo LogError
-    
-    ' Find Sheet1 safely
-    Set ws1 = Nothing
-    For Each ws In ThisWorkbook.Sheets
-        If ws.Name = "Sheet1" Or ws.Index = 1 Then
-            Set ws1 = ws
-            Exit For
-        End If
-    Next ws
-    
+    On Error Resume Next
+    Set ws1 = ThisWorkbook.Sheets("Sheet1")
     If ws1 Is Nothing Then
-        Set ws1 = ThisWorkbook.Sheets(1) ' Use first sheet as fallback
+        Set ws1 = ThisWorkbook.Sheets(1)
     End If
+    On Error GoTo 0
     
     If Not ws1 Is Nothing Then
         With ws1
-            ' Setup headers if not present
+            ' Ensure headers are present
             If .Cells(1, 2).Value = "" Then
                 .Cells(1, 2).Value = "File Name"
-                .Cells(1, 3).Value = "Source Folder"
-                .Cells(1, 4).Value = "Processing Time (seconds)"
-                
-                On Error Resume Next
-                .Range("B1:D1").Font.Bold = True
-                .Range("B1:D1").Interior.Color = RGB(200, 200, 200)
-                On Error GoTo LogError
+                .Cells(1, 3).Value = "Processing Time (seconds)"
+                .Range("B1:C1").Font.Bold = True
+                .Range("B1:C1").Interior.Color = RGB(200, 200, 200)
+                .Columns("B:C").AutoFit
             End If
             
-            ' Add data
             .Cells(g_LogNextRow, 2).Value = fileName
-            .Cells(g_LogNextRow, 3).Value = sourceFolder
-            .Cells(g_LogNextRow, 4).Value = Format(processTime, "0.00")
-            
-            ' Color code by processing time for quick identification
-            On Error Resume Next
-            If processTime < 1 Then
-                .Cells(g_LogNextRow, 4).Interior.Color = RGB(255, 200, 200) ' Light red for very fast
-            ElseIf processTime < 3 Then
-                .Cells(g_LogNextRow, 4).Interior.Color = RGB(200, 255, 200) ' Light green for normal
-            Else
-                .Cells(g_LogNextRow, 4).Interior.Color = RGB(255, 255, 200) ' Light yellow for slow
-            End If
-            On Error GoTo LogError
-            
+            .Cells(g_LogNextRow, 3).Value = Format(processTime, "0.00") ' Format to 2 decimal places
             g_LogNextRow = g_LogNextRow + 1
         End With
     End If
-    
-LogError:
-    ' Continue even if logging fails
-    On Error GoTo 0
 End Sub
 
 '==================================================================================================
-' Setup worksheets with enhanced summary structure
+' Setup worksheets
 '==================================================================================================
 Sub SetupWorksheets(ByRef wsSummary As Worksheet, ByRef wsTemp As Worksheet)
-    Dim ws As Worksheet
+    On Error Resume Next
     
-    On Error GoTo SetupError
-    
-    ' Setup Intermediate Sheet
-    Set wsTemp = Nothing
-    For Each ws In ThisWorkbook.Sheets
-        If ws.Name = "Intermediate Sheet" Then
-            Set wsTemp = ws
-            Exit For
-        End If
-    Next ws
-    
+    Set wsTemp = ThisWorkbook.Sheets("Intermediate Sheet")
     If wsTemp Is Nothing Then
-        Set wsTemp = ThisWorkbook.Sheets.Add
+        Set wsTemp = ThisWorkbook.Sheets.Add(After:=ThisWorkbook.Sheets(ThisWorkbook.Sheets.Count))
         wsTemp.Name = "Intermediate Sheet"
     End If
-    
-    ' Clear the sheet safely
-    Application.DisplayAlerts = False
     wsTemp.Cells.Clear
-    Application.DisplayAlerts = True
 
-    ' Setup Summary Sheet
-    Set wsSummary = Nothing
-    For Each ws In ThisWorkbook.Sheets
-        If ws.Name = "Summary Sheet" Then
-            Set wsSummary = ws
-            Exit For
-        End If
-    Next ws
-    
+    Set wsSummary = ThisWorkbook.Sheets("Summary Sheet")
     If wsSummary Is Nothing Then
-        Set wsSummary = ThisWorkbook.Sheets.Add
+        Set wsSummary = ThisWorkbook.Sheets.Add(After:=ThisWorkbook.Sheets(ThisWorkbook.Sheets.Count))
         wsSummary.Name = "Summary Sheet"
     End If
-    
-    ' Clear the sheet safely
-    Application.DisplayAlerts = False
     wsSummary.Cells.Clear
-    Application.DisplayAlerts = True
+    On Error GoTo 0
 
-    ' Create enhanced header row for Summary Sheet
-    On Error Resume Next
+    ' Create header row for Summary Sheet
     With wsSummary
         .Cells(1, 1).Value = "Submission Date"
         .Cells(1, 2).Value = "Account #"
         .Cells(1, 3).Value = "Expire Date"
         .Cells(1, 4).Value = "Amount"
-        .Cells(1, 5).Value = "Source Name"
-        .Cells(1, 6).Value = "Source Folder"
-        
-        ' Format headers safely
-        .Range("A1:F1").Font.Bold = True
-        .Range("A1:F1").Interior.Color = RGB(200, 200, 200)
+        .Cells(1, 5).Value = "Source Name" ' New: Added Source Name column
     End With
-    On Error GoTo 0
-    
-    Exit Sub
-    
-SetupError:
-    Err.Raise 1004, "SetupWorksheets", "Failed to setup worksheets: " & Err.Description
 End Sub
 
 '==================================================================================================
-' Enhanced file processing with source folder tracking and performance improvements
+' Original efficient processing logic with improved file opening
 '==================================================================================================
-Sub ProcessSingleFile(ByVal fullPath As String, ByVal wsSummary As Worksheet, ByVal wsTemp As Worksheet, ByVal sourceFileName As String, ByVal sourceFolder As String)
+Sub ProcessSingleFile(ByVal fullPath As String, ByVal wsSummary As Worksheet, ByVal wsTemp As Worksheet, ByVal sourceFileName As String)
 
     Dim wbSource As Workbook
     Dim wsSource As Worksheet
@@ -381,9 +229,6 @@ Sub ProcessSingleFile(ByVal fullPath As String, ByVal wsSummary As Worksheet, By
     Dim tempColOffset As Long
     Dim i As Long
     Dim copyCurrentColumn As Boolean
-    Dim fileOpenTime As Double
-    Dim dataProcessTime As Double
-    Dim startOperationTime As Double
 
     ' Define the headers to find and their corresponding processing logic
     Dim searchKeys As Variant
@@ -395,115 +240,68 @@ Sub ProcessSingleFile(ByVal fullPath As String, ByVal wsSummary As Worksheet, By
     )
 
     On Error GoTo ErrorHandler
-    
-    startOperationTime = Timer
-    LogDebug "  -> Opening file: " & sourceFileName
 
-    ' Enhanced file opening with detailed logging
+    ' Enhanced file opening to prevent corruption warnings
     Set wbSource = OpenFileCleanly(fullPath)
-    fileOpenTime = Timer - startOperationTime
-    
-    If wbSource Is Nothing Then
-        LogDebug "  -> ERROR: Failed to open file: " & sourceFileName & " (Open time: " & Format(fileOpenTime, "0.00") & "s)"
-        GoTo ErrorHandler
-    End If
-    
-    LogDebug "  -> File opened successfully (Open time: " & Format(fileOpenTime, "0.00") & "s)"
+    If wbSource Is Nothing Then GoTo ErrorHandler
     
     Set wsSource = wbSource.Sheets(1)
-    
-    ' Performance optimization: Disable screen updating for source workbook
-    wbSource.Application.ScreenUpdating = False
 
-    startOperationTime = Timer
-    Dim totalRowsProcessed As Long
-    totalRowsProcessed = 0
-
-    ' Loop through each keyword to be found
+    ' Loop through each keyword to be found (ORIGINAL LOGIC - EFFICIENT)
     For colCounter = LBound(searchKeys) To UBound(searchKeys)
         searchKey = searchKeys(colCounter)(0)
         tempColOffset = searchKeys(colCounter)(1)
         copyCurrentColumn = searchKeys(colCounter)(2)
 
-        wsTemp.Cells.ClearContents
+        wsTemp.Cells.ClearContents ' Clear the temporary worksheet before each loop
 
         Set findRange = wsSource.Cells.Find(What:=searchKey, LookIn:=xlValues, LookAt:=xlWhole, MatchCase:=False)
 
         If Not findRange Is Nothing Then
-            LogDebug "    -> Found column: " & searchKey & " at " & findRange.Address
-            
             If copyCurrentColumn Then
                 targetColumnSource = findRange.Column
             Else
                 targetColumnSource = findRange.Column - 1
-                If targetColumnSource < 1 Then
-                    LogDebug "    -> WARNING: Column to left of " & searchKey & " is out of bounds, skipping"
-                    GoTo NextKey
-                End If
+                If targetColumnSource < 1 Then GoTo NextKey ' If in column A, cannot get the column to the left, so skip this key
             End If
 
             lastRowSource = wsSource.Cells(wsSource.Rows.Count, targetColumnSource).End(xlUp).Row
-            If lastRowSource <= findRange.Row Then
-                LogDebug "    -> WARNING: No data below header for " & searchKey & ", skipping"
-                GoTo NextKey
-            End If
+            If lastRowSource <= findRange.Row Then GoTo NextKey ' If there is no data below the header row, skip
 
-            Dim rowCount As Long
-            rowCount = lastRowSource - findRange.Row
-            totalRowsProcessed = totalRowsProcessed + rowCount
-            LogDebug "    -> Processing " & rowCount & " rows for " & searchKey
-
-            ' Performance optimization: Copy entire range at once
+            ' Copy data to the temporary worksheet (ORIGINAL EFFICIENT METHOD)
             wsSource.Range(wsSource.Cells(findRange.Row + 1, targetColumnSource), wsSource.Cells(lastRowSource, targetColumnSource)).Copy
             wsTemp.Cells(2, 1).PasteSpecial xlPasteValuesAndNumberFormats
             Application.CutCopyMode = False
 
-            ' Optimized data cleaning with batch operations
+            ' --- Data Cleaning Logic (ORIGINAL EFFICIENT METHOD) ---
             lastRowTemp = wsTemp.Cells(wsTemp.Rows.Count, 1).End(xlUp).Row
             If lastRowTemp >= 2 Then
-                Dim deleteCount As Long
-                deleteCount = 0
-                
-                ' Clean data in reverse order for efficiency
                 For i = lastRowTemp To 2 Step -1
                     Dim cellValue As String
                     cellValue = Trim(wsTemp.Cells(i, 1).Value)
                     If cellValue = "" Or cellValue = CStr(searchKey) Or (CStr(searchKey) = "Submission Date" And InStr(1, cellValue, "Submission Count", vbTextCompare) > 0) Then
                         wsTemp.Rows(i).Delete
-                        deleteCount = deleteCount + 1
                     End If
                 Next i
-                
-                LogDebug "    -> Cleaned " & deleteCount & " invalid rows for " & searchKey
             End If
+            ' --- End Data Cleaning ---
 
-            ' Copy cleaned data to summary sheet with both source name and folder
+            ' Copy the cleaned data to the summary sheet (ORIGINAL EFFICIENT METHOD)
             lastRowTemp = wsTemp.Cells(wsTemp.Rows.Count, 1).End(xlUp).Row
             If lastRowTemp >= 2 Then
+                ' Key Step: Find the next empty row in the summary sheet to append data
                 nextSummaryRow = wsSummary.Cells(wsSummary.Rows.Count, tempColOffset).End(xlUp).Row + 1
-                Dim dataRowCount As Long
-                dataRowCount = lastRowTemp - 1
-                
-                ' Copy data
                 wsTemp.Range("A2:A" & lastRowTemp).Copy
                 wsSummary.Cells(nextSummaryRow, tempColOffset).PasteSpecial xlPasteValuesAndNumberFormats
                 Application.CutCopyMode = False
                 
-                ' Fill source information for new rows
-                wsSummary.Range(wsSummary.Cells(nextSummaryRow, 5), wsSummary.Cells(nextSummaryRow + dataRowCount - 1, 5)).Value = sourceFileName
-                wsSummary.Range(wsSummary.Cells(nextSummaryRow, 6), wsSummary.Cells(nextSummaryRow + dataRowCount - 1, 6)).Value = sourceFolder
-                
-                LogDebug "    -> Added " & dataRowCount & " rows to summary for " & searchKey
+                ' New: Fill the "Source Name" column for the newly added rows
+                wsSummary.Range(wsSummary.Cells(nextSummaryRow, 5), wsSummary.Cells(nextSummaryRow + lastRowTemp - 2, 5)).Value = sourceFileName
             End If
-        Else
-            LogDebug "    -> Column not found: " & searchKey
         End If
 
 NextKey:
     Next colCounter
-
-    dataProcessTime = Timer - startOperationTime
-    LogDebug "  -> Data processing completed (Process time: " & Format(dataProcessTime, "0.00") & "s, Total rows: " & totalRowsProcessed & ")"
 
 CleanUp:
     If Not wbSource Is Nothing Then
@@ -512,13 +310,13 @@ CleanUp:
     Exit Sub
 
 ErrorHandler:
-    LogDebug "  -> ERROR in ProcessSingleFile for " & sourceFileName & ": " & Err.Description & " (Error " & Err.Number & ")"
+    ' Continue processing other files if one fails
     Resume CleanUp
 
 End Sub
 
 '==================================================================================================
-' Enhanced file opening with comprehensive error handling and logging
+' Enhanced file opening to prevent corruption warnings
 '==================================================================================================
 Function OpenFileCleanly(ByVal fullPath As String) As Workbook
     Dim wb As Workbook
@@ -530,33 +328,21 @@ Function OpenFileCleanly(ByVal fullPath As String) As Workbook
     
     ' Check if file exists and is accessible
     If Not fso.FileExists(fullPath) Then
-        LogDebug "    -> File does not exist: " & fullPath
         Set OpenFileCleanly = Nothing
         Exit Function
     End If
     
-    ' Check file size (files < 1KB might be corrupted or empty)
-    Dim fileSize As Long
-    fileSize = fso.GetFile(fullPath).Size
-    If fileSize < 1024 Then
-        LogDebug "    -> WARNING: File very small (" & fileSize & " bytes): " & fullPath
-    End If
-    
-    ' Method 1: Standard opening with protection against corruption warnings
-    Application.DisplayAlerts = False
+    ' Method 1: Try opening with minimal parameters to reduce corruption warnings
     Set wb = Application.Workbooks.Open( _
         fileName:=fullPath, _
         ReadOnly:=True, _
         UpdateLinks:=False, _
-        AddToMru:=False, _
-        IgnoreReadOnlyRecommended:=True _
+        AddToMru:=False _
     )
-    Application.DisplayAlerts = True
     
     If Not wb Is Nothing Then
         ' Handle Protected View automatically
         If Not wb.ProtectedViewWindow Is Nothing Then
-            LogDebug "    -> File opened in Protected View, enabling editing"
             wb.ProtectedViewWindow.Edit
             DoEvents
         End If
@@ -564,28 +350,26 @@ Function OpenFileCleanly(ByVal fullPath As String) As Workbook
         Exit Function
     End If
     
-    ' Method 2: Try with different parameters if first method fails
+    ' Method 2: If first method fails, try with notification off
     Application.DisplayAlerts = False
     Set wb = Application.Workbooks.Open( _
         fileName:=fullPath, _
-        ReadOnly:=True, _
-        CorruptLoad:=xlRepairFile _
+        ReadOnly:=True _
     )
     Application.DisplayAlerts = True
     
     If Not wb Is Nothing Then
-        LogDebug "    -> File opened with repair mode"
         Set OpenFileCleanly = wb
         Exit Function
     End If
     
-    LogDebug "    -> FAILED: All file opening methods failed for: " & fullPath
+    ' If all methods fail, return Nothing
     Set OpenFileCleanly = Nothing
     
 End Function
 
 '==================================================================================================
-' Enhanced save function with source folder column
+' Save Summary Sheet as separate workbook in output folder
 '==================================================================================================
 Sub SaveSummaryToOutputFolder(ByVal wsSummary As Worksheet, ByVal outputPath As String)
     Dim newWb As Workbook
@@ -595,32 +379,25 @@ Sub SaveSummaryToOutputFolder(ByVal wsSummary As Worksheet, ByVal outputPath As 
     
     On Error GoTo SaveError
     
-    LogDebug "Saving summary workbook..."
-    
+    ' Create new workbook
     Set newWb = Application.Workbooks.Add
     Set newWs = newWb.Sheets(1)
     newWs.Name = "Reconciliation Summary"
     
     ' Copy all data from summary sheet
-    If wsSummary.UsedRange.Rows.Count > 0 Then
-        wsSummary.UsedRange.Copy
+    If wsSummary.usedRange.Rows.Count > 0 Then
+        wsSummary.usedRange.Copy
         newWs.Range("A1").PasteSpecial xlPasteValuesAndNumberFormats
         Application.CutCopyMode = False
     End If
     
     ' Format the new worksheet
     With newWs
-        .Range("A1:F1").Font.Bold = True
-        .Range("A1:F1").Interior.Color = RGB(200, 200, 200)
-        .Columns("A:F").AutoFit
-        
-        ' Add summary information
-        Dim lastRow As Long
-        lastRow = .Cells(.Rows.Count, 1).End(xlUp).Row
-        .Cells(lastRow + 2, 1).Value = "Summary Statistics:"
-        .Cells(lastRow + 3, 1).Value = "Total Records: " & (lastRow - 1)
-        .Cells(lastRow + 4, 1).Value = "Generated: " & Now
-        .Range(.Cells(lastRow + 2, 1), .Cells(lastRow + 4, 1)).Font.Bold = True
+        ' Update header range to include the new column E
+        .Range("A1:E1").Font.Bold = True
+        .Range("A1:E1").Interior.Color = RGB(200, 200, 200)
+        ' Update column autofit to include column E
+        .Columns("A:E").AutoFit
     End With
     
     ' Generate filename with timestamp
@@ -633,8 +410,6 @@ Sub SaveSummaryToOutputFolder(ByVal wsSummary As Worksheet, ByVal outputPath As 
     newWb.Close SaveChanges:=False
     Application.DisplayAlerts = True
     
-    LogDebug "Summary saved successfully: " & fullOutputPath
-    
     Set newWb = Nothing
     Set newWs = Nothing
     Exit Sub
@@ -645,80 +420,9 @@ SaveError:
         newWb.Close SaveChanges:=False
         Set newWb = Nothing
     End If
-    LogDebug "ERROR saving summary file: " & Err.Description
     MsgBox "Error saving summary file: " & Err.Description, vbExclamation, "Save Error"
     
 End Sub
 
-'==================================================================================================
-' Debug logging initialization
-'==================================================================================================
-Sub InitializeDebugLog()
-    If Not g_DebugMode Then Exit Sub
-    
-    Dim wsDebug As Worksheet
-    Dim ws As Worksheet
-    Dim debugExists As Boolean
-    
-    On Error GoTo DebugError
-    
-    ' Check if Debug Log sheet already exists
-    debugExists = False
-    For Each ws In ThisWorkbook.Sheets
-        If ws.Name = "Debug Log" Then
-            Set wsDebug = ws
-            debugExists = True
-            Exit For
-        End If
-    Next ws
-    
-    ' Create Debug Log sheet if it doesn't exist
-    If Not debugExists Then
-        Set wsDebug = ThisWorkbook.Sheets.Add
-        wsDebug.Name = "Debug Log"
-    End If
-    
-    ' Setup headers safely
-    Application.DisplayAlerts = False
-    wsDebug.Cells.Clear
-    Application.DisplayAlerts = True
-    
-    wsDebug.Cells(1, 1).Value = "Timestamp"
-    wsDebug.Cells(1, 2).Value = "Debug Message"
-    
-    On Error Resume Next
-    wsDebug.Range("A1:B1").Font.Bold = True
-    wsDebug.Range("A1:B1").Interior.Color = RGB(200, 200, 200)
-    On Error GoTo 0
-    
-    LogDebug "=== DEBUG LOGGING STARTED ==="
-    Exit Sub
-    
-DebugError:
-    g_DebugMode = False ' Disable debug mode if setup fails
-    Exit Sub
-End Sub
 
-'==================================================================================================
-' Debug logging function
-'==================================================================================================
-Sub LogDebug(ByVal message As String)
-    If Not g_DebugMode Then Exit Sub
-    
-    Dim wsDebug As Worksheet
-    Dim nextRow As Long
-    
-    On Error Resume Next
-    Set wsDebug = ThisWorkbook.Sheets("Debug Log")
-    If wsDebug Is Nothing Then Exit Sub
-    On Error GoTo 0
-    
-    nextRow = wsDebug.Cells(wsDebug.Rows.Count, 1).End(xlUp).Row + 1
-    wsDebug.Cells(nextRow, 1).Value = Format(Now, "hh:mm:ss.000")
-    wsDebug.Cells(nextRow, 2).Value = message
-    
-    ' Auto-resize columns periodically
-    If nextRow Mod 50 = 0 Then
-        wsDebug.Columns("A:B").AutoFit
-    End If
-End Sub
+
