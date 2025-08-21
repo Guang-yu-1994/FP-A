@@ -1,6 +1,43 @@
 Option Explicit
 
 '==================================================================================================
+' Simple test version to isolate issues
+'==================================================================================================
+Sub Test_BasicSetup()
+    Dim wsSummary As Worksheet
+    Dim wsTemp As Worksheet
+    
+    Application.ScreenUpdating = False
+    Application.DisplayAlerts = False
+    
+    On Error GoTo TestError
+    
+    ' Test worksheet setup
+    MsgBox "Testing worksheet setup...", vbInformation, "Test"
+    SetupWorksheets wsSummary, wsTemp
+    
+    ' Test basic operations
+    MsgBox "Testing basic operations...", vbInformation, "Test"
+    wsSummary.Cells(2, 1).Value = "Test"
+    wsTemp.Cells(1, 1).Value = "Test"
+    
+    ' Test logging
+    MsgBox "Testing logging...", vbInformation, "Test"
+    g_LogNextRow = 2
+    LogFileProcessToSheet1 "Test.xlsx", "TestFolder", 1.5
+    
+    MsgBox "All tests passed successfully!", vbInformation, "Test Complete"
+    GoTo TestCleanup
+    
+TestError:
+    MsgBox "Test failed at: " & Err.Description & vbCrLf & "Error: " & Err.Number, vbCritical, "Test Error"
+    
+TestCleanup:
+    Application.ScreenUpdating = True
+    Application.DisplayAlerts = True
+End Sub
+
+'==================================================================================================
 ' Global variables for statistics and debugging
 '==================================================================================================
 Private g_TotalXlsFiles As Long
@@ -203,13 +240,22 @@ End Sub
 '==================================================================================================
 Sub LogFileProcessToSheet1(ByVal fileName As String, ByVal sourceFolder As String, ByVal processTime As Double)
     Dim ws1 As Worksheet
+    Dim ws As Worksheet
     
-    On Error Resume Next
-    Set ws1 = ThisWorkbook.Sheets("Sheet1")
+    On Error GoTo LogError
+    
+    ' Find Sheet1 safely
+    Set ws1 = Nothing
+    For Each ws In ThisWorkbook.Sheets
+        If ws.Name = "Sheet1" Or ws.Index = 1 Then
+            Set ws1 = ws
+            Exit For
+        End If
+    Next ws
+    
     If ws1 Is Nothing Then
-        Set ws1 = ThisWorkbook.Sheets(1)
+        Set ws1 = ThisWorkbook.Sheets(1) ' Use first sheet as fallback
     End If
-    On Error GoTo 0
     
     If Not ws1 Is Nothing Then
         With ws1
@@ -218,62 +264,104 @@ Sub LogFileProcessToSheet1(ByVal fileName As String, ByVal sourceFolder As Strin
                 .Cells(1, 2).Value = "File Name"
                 .Cells(1, 3).Value = "Source Folder"
                 .Cells(1, 4).Value = "Processing Time (seconds)"
+                
+                On Error Resume Next
                 .Range("B1:D1").Font.Bold = True
                 .Range("B1:D1").Interior.Color = RGB(200, 200, 200)
+                On Error GoTo LogError
             End If
             
+            ' Add data
             .Cells(g_LogNextRow, 2).Value = fileName
             .Cells(g_LogNextRow, 3).Value = sourceFolder
             .Cells(g_LogNextRow, 4).Value = Format(processTime, "0.00")
             
             ' Color code by processing time for quick identification
+            On Error Resume Next
             If processTime < 1 Then
-                .Cells(g_LogNextRow, 4).Interior.Color = RGB(255, 200, 200) ' Light red for very fast (potential issues)
+                .Cells(g_LogNextRow, 4).Interior.Color = RGB(255, 200, 200) ' Light red for very fast
             ElseIf processTime < 3 Then
                 .Cells(g_LogNextRow, 4).Interior.Color = RGB(200, 255, 200) ' Light green for normal
             Else
                 .Cells(g_LogNextRow, 4).Interior.Color = RGB(255, 255, 200) ' Light yellow for slow
             End If
+            On Error GoTo LogError
             
             g_LogNextRow = g_LogNextRow + 1
         End With
     End If
+    
+LogError:
+    ' Continue even if logging fails
+    On Error GoTo 0
 End Sub
 
 '==================================================================================================
 ' Setup worksheets with enhanced summary structure
 '==================================================================================================
 Sub SetupWorksheets(ByRef wsSummary As Worksheet, ByRef wsTemp As Worksheet)
-    On Error Resume Next
+    Dim ws As Worksheet
     
-    Set wsTemp = ThisWorkbook.Sheets("Intermediate Sheet")
+    On Error GoTo SetupError
+    
+    ' Setup Intermediate Sheet
+    Set wsTemp = Nothing
+    For Each ws In ThisWorkbook.Sheets
+        If ws.Name = "Intermediate Sheet" Then
+            Set wsTemp = ws
+            Exit For
+        End If
+    Next ws
+    
     If wsTemp Is Nothing Then
-        Set wsTemp = ThisWorkbook.Sheets.Add(After:=ThisWorkbook.Sheets(ThisWorkbook.Sheets.Count))
+        Set wsTemp = ThisWorkbook.Sheets.Add
         wsTemp.Name = "Intermediate Sheet"
     End If
+    
+    ' Clear the sheet safely
+    Application.DisplayAlerts = False
     wsTemp.Cells.Clear
+    Application.DisplayAlerts = True
 
-    Set wsSummary = ThisWorkbook.Sheets("Summary Sheet")
+    ' Setup Summary Sheet
+    Set wsSummary = Nothing
+    For Each ws In ThisWorkbook.Sheets
+        If ws.Name = "Summary Sheet" Then
+            Set wsSummary = ws
+            Exit For
+        End If
+    Next ws
+    
     If wsSummary Is Nothing Then
-        Set wsSummary = ThisWorkbook.Sheets.Add(After:=ThisWorkbook.Sheets(ThisWorkbook.Sheets.Count))
+        Set wsSummary = ThisWorkbook.Sheets.Add
         wsSummary.Name = "Summary Sheet"
     End If
+    
+    ' Clear the sheet safely
+    Application.DisplayAlerts = False
     wsSummary.Cells.Clear
-    On Error GoTo 0
+    Application.DisplayAlerts = True
 
     ' Create enhanced header row for Summary Sheet
+    On Error Resume Next
     With wsSummary
         .Cells(1, 1).Value = "Submission Date"
         .Cells(1, 2).Value = "Account #"
         .Cells(1, 3).Value = "Expire Date"
         .Cells(1, 4).Value = "Amount"
         .Cells(1, 5).Value = "Source Name"
-        .Cells(1, 6).Value = "Source Folder" ' New column
+        .Cells(1, 6).Value = "Source Folder"
         
-        ' Format headers
+        ' Format headers safely
         .Range("A1:F1").Font.Bold = True
         .Range("A1:F1").Interior.Color = RGB(200, 200, 200)
     End With
+    On Error GoTo 0
+    
+    Exit Sub
+    
+SetupError:
+    Err.Raise 1004, "SetupWorksheets", "Failed to setup worksheets: " & Err.Description
 End Sub
 
 '==================================================================================================
@@ -569,21 +657,46 @@ Sub InitializeDebugLog()
     If Not g_DebugMode Then Exit Sub
     
     Dim wsDebug As Worksheet
-    On Error Resume Next
-    Set wsDebug = ThisWorkbook.Sheets("Debug Log")
-    If wsDebug Is Nothing Then
-        Set wsDebug = ThisWorkbook.Sheets.Add(After:=ThisWorkbook.Sheets(ThisWorkbook.Sheets.Count))
+    Dim ws As Worksheet
+    Dim debugExists As Boolean
+    
+    On Error GoTo DebugError
+    
+    ' Check if Debug Log sheet already exists
+    debugExists = False
+    For Each ws In ThisWorkbook.Sheets
+        If ws.Name = "Debug Log" Then
+            Set wsDebug = ws
+            debugExists = True
+            Exit For
+        End If
+    Next ws
+    
+    ' Create Debug Log sheet if it doesn't exist
+    If Not debugExists Then
+        Set wsDebug = ThisWorkbook.Sheets.Add
         wsDebug.Name = "Debug Log"
     End If
-    On Error GoTo 0
     
+    ' Setup headers safely
+    Application.DisplayAlerts = False
     wsDebug.Cells.Clear
+    Application.DisplayAlerts = True
+    
     wsDebug.Cells(1, 1).Value = "Timestamp"
     wsDebug.Cells(1, 2).Value = "Debug Message"
+    
+    On Error Resume Next
     wsDebug.Range("A1:B1").Font.Bold = True
     wsDebug.Range("A1:B1").Interior.Color = RGB(200, 200, 200)
+    On Error GoTo 0
     
     LogDebug "=== DEBUG LOGGING STARTED ==="
+    Exit Sub
+    
+DebugError:
+    g_DebugMode = False ' Disable debug mode if setup fails
+    Exit Sub
 End Sub
 
 '==================================================================================================
