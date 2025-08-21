@@ -1,4 +1,3 @@
-
 Option Explicit
 
 '==================================================================================================
@@ -6,10 +5,11 @@ Option Explicit
 '==================================================================================================
 Private g_TotalXlsFiles As Long
 Private g_TotalACTFolders As Long
-Private g_LogNextRow As Long ' New: To track the next row for logging in Sheet1
+Private g_LogNextRow As Long
+Private g_FileReadStatus As Collection ' New: To track file read status
 
 '==================================================================================================
-' Main Procedure: Keep original efficient logic, fix file reading issues
+' Main Procedure: Enhanced with folder-based processing
 '==================================================================================================
 Sub Main_ProcessAllFiles()
 
@@ -23,20 +23,17 @@ Sub Main_ProcessAllFiles()
     Dim fso As Object
     Dim rootFolder As Object
     Dim subFolder As Object
-    Dim fileItem As Object
     Dim basePath As String
     Dim outputPath As String
     Dim wsSummary As Worksheet
-    Dim wsTemp As Worksheet
-    Dim startTime As Double ' New: To record processing start time
-    Dim endTime As Double   ' New: To record processing end time
+    Dim folderStartTime As Double
+    Dim folderEndTime As Double
 
     ' Initialize statistics
     g_TotalXlsFiles = 0
     g_TotalACTFolders = 0
-    
-    ' New: Initialize the log row for Sheet1 (starting from row 2, as row 1 is for general stats)
     g_LogNextRow = 2
+    Set g_FileReadStatus = New Collection
 
     Set fso = CreateObject("Scripting.FileSystemObject")
     basePath = ThisWorkbook.Path & "\" & ROOT_FOLDER_NAME
@@ -61,40 +58,29 @@ Sub Main_ProcessAllFiles()
     On Error GoTo ErrorHandler
 
     ' Setup worksheets
-    SetupWorksheets wsSummary, wsTemp
+    SetupWorksheets wsSummary
 
     Set rootFolder = fso.GetFolder(basePath)
 
-    ' Loop through subfolders
+    ' Process each ACT folder separately
     For Each subFolder In rootFolder.SubFolders
         If InStr(1, subFolder.Name, FOLDER_KEYWORD, vbTextCompare) > 0 Then
             g_TotalACTFolders = g_TotalACTFolders + 1
             
-            ' Loop through files in subfolder
-            For Each fileItem In subFolder.Files
-                If InStr(1, fileItem.Name, FILE_KEYWORD, vbTextCompare) > 0 And _
-                   (LCase(fso.GetExtensionName(fileItem.Name)) = "xls" Or _
-                    LCase(fso.GetExtensionName(fileItem.Name)) = "xlsx") Then
-                    
-                    g_TotalXlsFiles = g_TotalXlsFiles + 1
-                    
-                    startTime = Timer ' Record start time
-
-                    ' Process single file - keep original efficient logic
-                    ' Pass the file name to ProcessSingleFile for logging
-                    ProcessSingleFile fileItem.Path, wsSummary, wsTemp, fileItem.Name
-                    
-                    endTime = Timer ' Record end time
-                    
-                    ' Log file name and processing time to Sheet1
-                    LogFileProcessToSheet1 fileItem.Name, endTime - startTime
-                    
-                    ' Memory cleanup
-                    DoEvents
-                End If
-            Next fileItem
+            folderStartTime = Timer
+            
+            ' Process entire folder at once
+            ProcessFolderFiles subFolder, wsSummary
+            
+            folderEndTime = Timer
+            
+            ' Log folder processing details
+            LogFolderProcessToSheet1 subFolder.Name, folderEndTime - folderStartTime
         End If
     Next subFolder
+
+    ' Final cleanup: Remove rows where Amount column is empty
+    CleanupSummarySheet wsSummary
 
     ' Write general statistics to Sheet1 A1 cell
     WriteStatisticsToSheet1
@@ -116,15 +102,414 @@ CleanUp:
     Set fso = Nothing
     Set rootFolder = Nothing
     Set subFolder = Nothing
-    Set fileItem = Nothing
     Set wsSummary = Nothing
-    Set wsTemp = Nothing
+    Set g_FileReadStatus = Nothing
     Exit Sub
 
 ErrorHandler:
     MsgBox "Error in main procedure: " & Err.Description, vbCritical, "Error"
     Resume CleanUp
 
+End Sub
+
+'==================================================================================================
+' Process all files in a folder using optimized paste-then-filter approach
+'==================================================================================================
+Sub ProcessFolderFiles(ByVal folder As Object, ByVal wsSummary As Worksheet)
+    Dim fso As Object
+    Dim fileItem As Object
+    Dim fileCount As Long
+    
+    ' Create temporary worksheets for each column
+    Dim wsTemp1 As Worksheet ' Submission Date
+    Dim wsTemp2 As Worksheet ' Account #
+    Dim wsTemp3 As Worksheet ' Expire Date
+    Dim wsTemp4 As Worksheet ' Amount
+    
+    ' Arrays to store file information
+    Dim fileNames() As String
+    Dim sourceFolder As String
+    
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    sourceFolder = folder.Name
+    fileCount = 0
+    
+    ' Setup temporary worksheets
+    SetupTempWorksheets wsTemp1, wsTemp2, wsTemp3, wsTemp4
+    
+    ' Count files first to dimension array
+    For Each fileItem In folder.Files
+        If InStr(1, fileItem.Name, "ACT", vbTextCompare) > 0 And _
+           (LCase(fso.GetExtensionName(fileItem.Name)) = "xls" Or _
+            LCase(fso.GetExtensionName(fileItem.Name)) = "xlsx") Then
+            fileCount = fileCount + 1
+        End If
+    Next fileItem
+    
+    If fileCount = 0 Then Exit Sub
+    
+    ReDim fileNames(1 To fileCount)
+    fileCount = 0
+    
+    ' First pass: Paste all data from all files to temporary sheets
+    For Each fileItem In folder.Files
+        If InStr(1, fileItem.Name, "ACT", vbTextCompare) > 0 And _
+           (LCase(fso.GetExtensionName(fileItem.Name)) = "xls" Or _
+            LCase(fso.GetExtensionName(fileItem.Name)) = "xlsx") Then
+            
+            fileCount = fileCount + 1
+            fileNames(fileCount) = fileItem.Name
+            g_TotalXlsFiles = g_TotalXlsFiles + 1
+            
+            ' Paste data to temporary sheets
+            PasteFileDataToTempSheets fileItem.Path, wsTemp1, wsTemp2, wsTemp3, wsTemp4, fileItem.Name
+        End If
+    Next fileItem
+    
+    ' Second pass: Clean and consolidate data
+    CleanAndConsolidateData wsTemp1, wsTemp2, wsTemp3, wsTemp4, wsSummary, sourceFolder, fileNames
+    
+    ' Clear temporary worksheets for next folder
+    ClearTempWorksheets wsTemp1, wsTemp2, wsTemp3, wsTemp4
+    
+End Sub
+
+'==================================================================================================
+' Setup temporary worksheets
+'==================================================================================================
+Sub SetupTempWorksheets(ByRef wsTemp1 As Worksheet, ByRef wsTemp2 As Worksheet, _
+                       ByRef wsTemp3 As Worksheet, ByRef wsTemp4 As Worksheet)
+    On Error Resume Next
+    
+    ' Create or get temporary worksheets
+    Set wsTemp1 = ThisWorkbook.Sheets("Temp_SubmissionDate")
+    If wsTemp1 Is Nothing Then
+        Set wsTemp1 = ThisWorkbook.Sheets.Add(After:=ThisWorkbook.Sheets(ThisWorkbook.Sheets.Count))
+        wsTemp1.Name = "Temp_SubmissionDate"
+    End If
+    
+    Set wsTemp2 = ThisWorkbook.Sheets("Temp_Account")
+    If wsTemp2 Is Nothing Then
+        Set wsTemp2 = ThisWorkbook.Sheets.Add(After:=ThisWorkbook.Sheets(ThisWorkbook.Sheets.Count))
+        wsTemp2.Name = "Temp_Account"
+    End If
+    
+    Set wsTemp3 = ThisWorkbook.Sheets("Temp_ExpireDate")
+    If wsTemp3 Is Nothing Then
+        Set wsTemp3 = ThisWorkbook.Sheets.Add(After:=ThisWorkbook.Sheets(ThisWorkbook.Sheets.Count))
+        wsTemp3.Name = "Temp_ExpireDate"
+    End If
+    
+    Set wsTemp4 = ThisWorkbook.Sheets("Temp_Amount")
+    If wsTemp4 Is Nothing Then
+        Set wsTemp4 = ThisWorkbook.Sheets.Add(After:=ThisWorkbook.Sheets(ThisWorkbook.Sheets.Count))
+        wsTemp4.Name = "Temp_Amount"
+    End If
+    
+    On Error GoTo 0
+End Sub
+
+'==================================================================================================
+' Clear temporary worksheets
+'==================================================================================================
+Sub ClearTempWorksheets(ByVal wsTemp1 As Worksheet, ByVal wsTemp2 As Worksheet, _
+                       ByVal wsTemp3 As Worksheet, ByVal wsTemp4 As Worksheet)
+    wsTemp1.Cells.Clear
+    wsTemp2.Cells.Clear
+    wsTemp3.Cells.Clear
+    wsTemp4.Cells.Clear
+End Sub
+
+'==================================================================================================
+' Paste file data to temporary sheets
+'==================================================================================================
+Sub PasteFileDataToTempSheets(ByVal fullPath As String, ByVal wsTemp1 As Worksheet, _
+                             ByVal wsTemp2 As Worksheet, ByVal wsTemp3 As Worksheet, _
+                             ByVal wsTemp4 As Worksheet, ByVal fileName As String)
+    
+    Dim wbSource As Workbook
+    Dim wsSource As Worksheet
+    Dim findRange As Range
+    Dim lastRowSource As Long
+    Dim nextTempRow As Long
+    Dim targetColumn As Long
+    Dim readStatus As String
+    
+    readStatus = "Failed"
+    
+    On Error GoTo ErrorHandler
+    
+    Set wbSource = OpenFileCleanly(fullPath)
+    If wbSource Is Nothing Then GoTo ErrorHandler
+    
+    Set wsSource = wbSource.Sheets(1)
+    readStatus = "Success"
+    
+    ' Process Submission Date
+    Set findRange = wsSource.Cells.Find(What:="Submission Date", LookIn:=xlValues, LookAt:=xlWhole, MatchCase:=False)
+    If Not findRange Is Nothing Then
+        targetColumn = findRange.Column
+        lastRowSource = wsSource.Cells(wsSource.Rows.Count, targetColumn).End(xlUp).Row
+        If lastRowSource > findRange.Row Then
+            nextTempRow = wsTemp1.Cells(wsTemp1.Rows.Count, 1).End(xlUp).Row + 1
+            If nextTempRow = 1 Then nextTempRow = 1
+            wsSource.Range(wsSource.Cells(findRange.Row + 1, targetColumn), wsSource.Cells(lastRowSource, targetColumn)).Copy
+            wsTemp1.Cells(nextTempRow, 1).PasteSpecial xlPasteValuesAndNumberFormats
+            ' Add file name reference
+            wsTemp1.Range(wsTemp1.Cells(nextTempRow, 2), wsTemp1.Cells(nextTempRow + lastRowSource - findRange.Row - 1, 2)).Value = fileName
+            Application.CutCopyMode = False
+        End If
+    End If
+    
+    ' Process Account # (column to the left)
+    Set findRange = wsSource.Cells.Find(What:="Account #", LookIn:=xlValues, LookAt:=xlWhole, MatchCase:=False)
+    If Not findRange Is Nothing And findRange.Column > 1 Then
+        targetColumn = findRange.Column - 1
+        lastRowSource = wsSource.Cells(wsSource.Rows.Count, targetColumn).End(xlUp).Row
+        If lastRowSource > findRange.Row Then
+            nextTempRow = wsTemp2.Cells(wsTemp2.Rows.Count, 1).End(xlUp).Row + 1
+            If nextTempRow = 1 Then nextTempRow = 1
+            wsSource.Range(wsSource.Cells(findRange.Row + 1, targetColumn), wsSource.Cells(lastRowSource, targetColumn)).Copy
+            wsTemp2.Cells(nextTempRow, 1).PasteSpecial xlPasteValuesAndNumberFormats
+            wsTemp2.Range(wsTemp2.Cells(nextTempRow, 2), wsTemp2.Cells(nextTempRow + lastRowSource - findRange.Row - 1, 2)).Value = fileName
+            Application.CutCopyMode = False
+        End If
+    End If
+    
+    ' Process Expire Date
+    Set findRange = wsSource.Cells.Find(What:="Expire Date", LookIn:=xlValues, LookAt:=xlWhole, MatchCase:=False)
+    If Not findRange Is Nothing Then
+        targetColumn = findRange.Column
+        lastRowSource = wsSource.Cells(wsSource.Rows.Count, targetColumn).End(xlUp).Row
+        If lastRowSource > findRange.Row Then
+            nextTempRow = wsTemp3.Cells(wsTemp3.Rows.Count, 1).End(xlUp).Row + 1
+            If nextTempRow = 1 Then nextTempRow = 1
+            wsSource.Range(wsSource.Cells(findRange.Row + 1, targetColumn), wsSource.Cells(lastRowSource, targetColumn)).Copy
+            wsTemp3.Cells(nextTempRow, 1).PasteSpecial xlPasteValuesAndNumberFormats
+            wsTemp3.Range(wsTemp3.Cells(nextTempRow, 2), wsTemp3.Cells(nextTempRow + lastRowSource - findRange.Row - 1, 2)).Value = fileName
+            Application.CutCopyMode = False
+        End If
+    End If
+    
+    ' Process Amount (column to the left)
+    Set findRange = wsSource.Cells.Find(What:="Amount", LookIn:=xlValues, LookAt:=xlWhole, MatchCase:=False)
+    If Not findRange Is Nothing And findRange.Column > 1 Then
+        targetColumn = findRange.Column - 1
+        lastRowSource = wsSource.Cells(wsSource.Rows.Count, targetColumn).End(xlUp).Row
+        If lastRowSource > findRange.Row Then
+            nextTempRow = wsTemp4.Cells(wsTemp4.Rows.Count, 1).End(xlUp).Row + 1
+            If nextTempRow = 1 Then nextTempRow = 1
+            wsSource.Range(wsSource.Cells(findRange.Row + 1, targetColumn), wsSource.Cells(lastRowSource, targetColumn)).Copy
+            wsTemp4.Cells(nextTempRow, 1).PasteSpecial xlPasteValuesAndNumberFormats
+            wsTemp4.Range(wsTemp4.Cells(nextTempRow, 2), wsTemp4.Cells(nextTempRow + lastRowSource - findRange.Row - 1, 2)).Value = fileName
+            Application.CutCopyMode = False
+        End If
+    End If
+
+CleanUp:
+    ' Store file read status
+    On Error Resume Next
+    g_FileReadStatus.Add readStatus, fileName
+    On Error GoTo 0
+    
+    If Not wbSource Is Nothing Then
+        wbSource.Close SaveChanges:=False
+    End If
+    Exit Sub
+
+ErrorHandler:
+    readStatus = "Failed"
+    Resume CleanUp
+
+End Sub
+
+'==================================================================================================
+' Clean and consolidate data from temporary sheets to summary
+'==================================================================================================
+Sub CleanAndConsolidateData(ByVal wsTemp1 As Worksheet, ByVal wsTemp2 As Worksheet, _
+                           ByVal wsTemp3 As Worksheet, ByVal wsTemp4 As Worksheet, _
+                           ByVal wsSummary As Worksheet, ByVal sourceFolder As String, _
+                           ByRef fileNames() As String)
+    
+    Dim i As Long, j As Long
+    Dim lastRow As Long
+    Dim cellValue As String
+    Dim maxRows As Long
+    Dim nextSummaryRow As Long
+    
+    ' Clean temporary sheets (remove empty rows and header duplicates)
+    CleanTempSheet wsTemp1, "Submission Date"
+    CleanTempSheet wsTemp2, "Account #"
+    CleanTempSheet wsTemp3, "Expire Date"
+    CleanTempSheet wsTemp4, "Amount"
+    
+    ' Find maximum rows among all temp sheets
+    maxRows = Application.Max( _
+        wsTemp1.Cells(wsTemp1.Rows.Count, 1).End(xlUp).Row, _
+        wsTemp2.Cells(wsTemp2.Rows.Count, 1).End(xlUp).Row, _
+        wsTemp3.Cells(wsTemp3.Rows.Count, 1).End(xlUp).Row, _
+        wsTemp4.Cells(wsTemp4.Rows.Count, 1).End(xlUp).Row _
+    )
+    
+    If maxRows < 1 Then Exit Sub
+    
+    ' Find next available row in summary sheet
+    nextSummaryRow = wsSummary.Cells(wsSummary.Rows.Count, 1).End(xlUp).Row + 1
+    If nextSummaryRow = 2 And wsSummary.Cells(1, 1).Value <> "" Then nextSummaryRow = 1
+    
+    ' Consolidate data row by row
+    For i = 1 To maxRows
+        With wsSummary
+            ' Submission Date (Column A)
+            If i <= wsTemp1.Cells(wsTemp1.Rows.Count, 1).End(xlUp).Row Then
+                .Cells(nextSummaryRow + i - 1, 1).Value = wsTemp1.Cells(i, 1).Value
+            End If
+            
+            ' Account # (Column B)
+            If i <= wsTemp2.Cells(wsTemp2.Rows.Count, 1).End(xlUp).Row Then
+                .Cells(nextSummaryRow + i - 1, 2).Value = wsTemp2.Cells(i, 1).Value
+            End If
+            
+            ' Expire Date (Column C)
+            If i <= wsTemp3.Cells(wsTemp3.Rows.Count, 1).End(xlUp).Row Then
+                .Cells(nextSummaryRow + i - 1, 3).Value = wsTemp3.Cells(i, 1).Value
+            End If
+            
+            ' Amount (Column D)
+            If i <= wsTemp4.Cells(wsTemp4.Rows.Count, 1).End(xlUp).Row Then
+                .Cells(nextSummaryRow + i - 1, 4).Value = wsTemp4.Cells(i, 1).Value
+            End If
+            
+            ' Source Name (Column E) - Get from the first non-empty temp sheet
+            Dim sourceName As String
+            If i <= wsTemp1.Cells(wsTemp1.Rows.Count, 1).End(xlUp).Row And wsTemp1.Cells(i, 2).Value <> "" Then
+                sourceName = wsTemp1.Cells(i, 2).Value
+            ElseIf i <= wsTemp2.Cells(wsTemp2.Rows.Count, 1).End(xlUp).Row And wsTemp2.Cells(i, 2).Value <> "" Then
+                sourceName = wsTemp2.Cells(i, 2).Value
+            ElseIf i <= wsTemp3.Cells(wsTemp3.Rows.Count, 1).End(xlUp).Row And wsTemp3.Cells(i, 2).Value <> "" Then
+                sourceName = wsTemp3.Cells(i, 2).Value
+            ElseIf i <= wsTemp4.Cells(wsTemp4.Rows.Count, 1).End(xlUp).Row And wsTemp4.Cells(i, 2).Value <> "" Then
+                sourceName = wsTemp4.Cells(i, 2).Value
+            End If
+            .Cells(nextSummaryRow + i - 1, 5).Value = sourceName
+            
+            ' Source Folder (Column F)
+            .Cells(nextSummaryRow + i - 1, 6).Value = sourceFolder
+        End With
+    Next i
+    
+End Sub
+
+'==================================================================================================
+' Clean individual temporary sheet
+'==================================================================================================
+Sub CleanTempSheet(ByVal ws As Worksheet, ByVal headerName As String)
+    Dim i As Long
+    Dim lastRow As Long
+    Dim cellValue As String
+    
+    lastRow = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row
+    If lastRow < 1 Then Exit Sub
+    
+    ' Clean from bottom to top
+    For i = lastRow To 1 Step -1
+        cellValue = Trim(CStr(ws.Cells(i, 1).Value))
+        If cellValue = "" Or cellValue = headerName Or _
+           (headerName = "Submission Date" And InStr(1, cellValue, "Submission Count", vbTextCompare) > 0) Then
+            ws.Rows(i).Delete
+        End If
+    Next i
+End Sub
+
+'==================================================================================================
+' Cleanup Summary Sheet - Remove rows where Amount is empty
+'==================================================================================================
+Sub CleanupSummarySheet(ByVal wsSummary As Worksheet)
+    Dim i As Long
+    Dim lastRow As Long
+    
+    lastRow = wsSummary.Cells(wsSummary.Rows.Count, 4).End(xlUp).Row ' Column D (Amount)
+    
+    ' Clean from bottom to top, skip header row
+    For i = lastRow To 2 Step -1
+        If Trim(CStr(wsSummary.Cells(i, 4).Value)) = "" Then
+            wsSummary.Rows(i).Delete
+        End If
+    Next i
+End Sub
+
+'==================================================================================================
+' Setup worksheets with new Source Folder column
+'==================================================================================================
+Sub SetupWorksheets(ByRef wsSummary As Worksheet)
+    On Error Resume Next
+    
+    Set wsSummary = ThisWorkbook.Sheets("Summary Sheet")
+    If wsSummary Is Nothing Then
+        Set wsSummary = ThisWorkbook.Sheets.Add(After:=ThisWorkbook.Sheets(ThisWorkbook.Sheets.Count))
+        wsSummary.Name = "Summary Sheet"
+    End If
+    wsSummary.Cells.Clear
+    On Error GoTo 0
+
+    ' Create header row for Summary Sheet with new Source Folder column
+    With wsSummary
+        .Cells(1, 1).Value = "Submission Date"
+        .Cells(1, 2).Value = "Account #"
+        .Cells(1, 3).Value = "Expire Date"
+        .Cells(1, 4).Value = "Amount"
+        .Cells(1, 5).Value = "Source Name"
+        .Cells(1, 6).Value = "Source Folder"
+    End With
+End Sub
+
+'==================================================================================================
+' Log folder processing details to Sheet1
+'==================================================================================================
+Sub LogFolderProcessToSheet1(ByVal folderName As String, ByVal processTime As Double)
+    Dim ws1 As Worksheet
+    Dim fileReadStatusText As String
+    Dim fileName As Variant
+    Dim statusCount As Long
+    
+    On Error Resume Next
+    Set ws1 = ThisWorkbook.Sheets("Sheet1")
+    If ws1 Is Nothing Then
+        Set ws1 = ThisWorkbook.Sheets(1)
+    End If
+    On Error GoTo 0
+    
+    If Not ws1 Is Nothing Then
+        With ws1
+            ' Ensure headers are present
+            If .Cells(1, 2).Value = "" Then
+                .Cells(1, 2).Value = "Source Folder"
+                .Cells(1, 3).Value = "Processing Time (seconds)"
+                .Cells(1, 4).Value = "File Read Status"
+                .Range("B1:D1").Font.Bold = True
+                .Range("B1:D1").Interior.Color = RGB(200, 200, 200)
+                .Columns("B:D").AutoFit
+            End If
+            
+            ' Generate file read status summary
+            statusCount = 0
+            fileReadStatusText = ""
+            For Each fileName In g_FileReadStatus
+                statusCount = statusCount + 1
+                If Len(fileReadStatusText) > 0 Then fileReadStatusText = fileReadStatusText & "; "
+                fileReadStatusText = fileReadStatusText & fileName & ":" & g_FileReadStatus(fileName)
+            Next fileName
+            
+            .Cells(g_LogNextRow, 2).Value = folderName
+            .Cells(g_LogNextRow, 3).Value = Format(processTime, "0.00")
+            .Cells(g_LogNextRow, 4).Value = fileReadStatusText
+            g_LogNextRow = g_LogNextRow + 1
+        End With
+    End If
+    
+    ' Clear file read status for next folder
+    Set g_FileReadStatus = New Collection
+    
 End Sub
 
 '==================================================================================================
@@ -148,171 +533,6 @@ Sub WriteStatisticsToSheet1()
             .Columns("A:A").AutoFit
         End With
     End If
-End Sub
-
-'==================================================================================================
-' New: Log file processing details to Sheet1
-'==================================================================================================
-Sub LogFileProcessToSheet1(ByVal fileName As String, ByVal processTime As Double)
-    Dim ws1 As Worksheet
-    
-    On Error Resume Next
-    Set ws1 = ThisWorkbook.Sheets("Sheet1")
-    If ws1 Is Nothing Then
-        Set ws1 = ThisWorkbook.Sheets(1)
-    End If
-    On Error GoTo 0
-    
-    If Not ws1 Is Nothing Then
-        With ws1
-            ' Ensure headers are present
-            If .Cells(1, 2).Value = "" Then
-                .Cells(1, 2).Value = "File Name"
-                .Cells(1, 3).Value = "Processing Time (seconds)"
-                .Range("B1:C1").Font.Bold = True
-                .Range("B1:C1").Interior.Color = RGB(200, 200, 200)
-                .Columns("B:C").AutoFit
-            End If
-            
-            .Cells(g_LogNextRow, 2).Value = fileName
-            .Cells(g_LogNextRow, 3).Value = Format(processTime, "0.00") ' Format to 2 decimal places
-            g_LogNextRow = g_LogNextRow + 1
-        End With
-    End If
-End Sub
-
-'==================================================================================================
-' Setup worksheets
-'==================================================================================================
-Sub SetupWorksheets(ByRef wsSummary As Worksheet, ByRef wsTemp As Worksheet)
-    On Error Resume Next
-    
-    Set wsTemp = ThisWorkbook.Sheets("Intermediate Sheet")
-    If wsTemp Is Nothing Then
-        Set wsTemp = ThisWorkbook.Sheets.Add(After:=ThisWorkbook.Sheets(ThisWorkbook.Sheets.Count))
-        wsTemp.Name = "Intermediate Sheet"
-    End If
-    wsTemp.Cells.Clear
-
-    Set wsSummary = ThisWorkbook.Sheets("Summary Sheet")
-    If wsSummary Is Nothing Then
-        Set wsSummary = ThisWorkbook.Sheets.Add(After:=ThisWorkbook.Sheets(ThisWorkbook.Sheets.Count))
-        wsSummary.Name = "Summary Sheet"
-    End If
-    wsSummary.Cells.Clear
-    On Error GoTo 0
-
-    ' Create header row for Summary Sheet
-    With wsSummary
-        .Cells(1, 1).Value = "Submission Date"
-        .Cells(1, 2).Value = "Account #"
-        .Cells(1, 3).Value = "Expire Date"
-        .Cells(1, 4).Value = "Amount"
-        .Cells(1, 5).Value = "Source Name" ' New: Added Source Name column
-    End With
-End Sub
-
-'==================================================================================================
-' Original efficient processing logic with improved file opening
-'==================================================================================================
-Sub ProcessSingleFile(ByVal fullPath As String, ByVal wsSummary As Worksheet, ByVal wsTemp As Worksheet, ByVal sourceFileName As String)
-
-    Dim wbSource As Workbook
-    Dim wsSource As Worksheet
-    Dim findRange As Range
-    Dim lastRowSource As Long
-    Dim lastRowTemp As Long
-    Dim nextSummaryRow As Long
-    Dim colCounter As Integer
-    Dim searchKey As Variant
-    Dim targetColumnSource As Long
-    Dim tempColOffset As Long
-    Dim i As Long
-    Dim copyCurrentColumn As Boolean
-
-    ' Define the headers to find and their corresponding processing logic
-    Dim searchKeys As Variant
-    searchKeys = Array( _
-        Array("Submission Date", 1, True), _
-        Array("Account #", 2, False), _
-        Array("Expire Date", 3, True), _
-        Array("Amount", 4, False) _
-    )
-
-    On Error GoTo ErrorHandler
-
-    ' Enhanced file opening to prevent corruption warnings
-    Set wbSource = OpenFileCleanly(fullPath)
-    If wbSource Is Nothing Then GoTo ErrorHandler
-    
-    Set wsSource = wbSource.Sheets(1)
-
-    ' Loop through each keyword to be found (ORIGINAL LOGIC - EFFICIENT)
-    For colCounter = LBound(searchKeys) To UBound(searchKeys)
-        searchKey = searchKeys(colCounter)(0)
-        tempColOffset = searchKeys(colCounter)(1)
-        copyCurrentColumn = searchKeys(colCounter)(2)
-
-        wsTemp.Cells.ClearContents ' Clear the temporary worksheet before each loop
-
-        Set findRange = wsSource.Cells.Find(What:=searchKey, LookIn:=xlValues, LookAt:=xlWhole, MatchCase:=False)
-
-        If Not findRange Is Nothing Then
-            If copyCurrentColumn Then
-                targetColumnSource = findRange.Column
-            Else
-                targetColumnSource = findRange.Column - 1
-                If targetColumnSource < 1 Then GoTo NextKey ' If in column A, cannot get the column to the left, so skip this key
-            End If
-
-            lastRowSource = wsSource.Cells(wsSource.Rows.Count, targetColumnSource).End(xlUp).Row
-            If lastRowSource <= findRange.Row Then GoTo NextKey ' If there is no data below the header row, skip
-
-            ' Copy data to the temporary worksheet (ORIGINAL EFFICIENT METHOD)
-            wsSource.Range(wsSource.Cells(findRange.Row + 1, targetColumnSource), wsSource.Cells(lastRowSource, targetColumnSource)).Copy
-            wsTemp.Cells(2, 1).PasteSpecial xlPasteValuesAndNumberFormats
-            Application.CutCopyMode = False
-
-            ' --- Data Cleaning Logic (ORIGINAL EFFICIENT METHOD) ---
-            lastRowTemp = wsTemp.Cells(wsTemp.Rows.Count, 1).End(xlUp).Row
-            If lastRowTemp >= 2 Then
-                For i = lastRowTemp To 2 Step -1
-                    Dim cellValue As String
-                    cellValue = Trim(wsTemp.Cells(i, 1).Value)
-                    If cellValue = "" Or cellValue = CStr(searchKey) Or (CStr(searchKey) = "Submission Date" And InStr(1, cellValue, "Submission Count", vbTextCompare) > 0) Then
-                        wsTemp.Rows(i).Delete
-                    End If
-                Next i
-            End If
-            ' --- End Data Cleaning ---
-
-            ' Copy the cleaned data to the summary sheet (ORIGINAL EFFICIENT METHOD)
-            lastRowTemp = wsTemp.Cells(wsTemp.Rows.Count, 1).End(xlUp).Row
-            If lastRowTemp >= 2 Then
-                ' Key Step: Find the next empty row in the summary sheet to append data
-                nextSummaryRow = wsSummary.Cells(wsSummary.Rows.Count, tempColOffset).End(xlUp).Row + 1
-                wsTemp.Range("A2:A" & lastRowTemp).Copy
-                wsSummary.Cells(nextSummaryRow, tempColOffset).PasteSpecial xlPasteValuesAndNumberFormats
-                Application.CutCopyMode = False
-                
-                ' New: Fill the "Source Name" column for the newly added rows
-                wsSummary.Range(wsSummary.Cells(nextSummaryRow, 5), wsSummary.Cells(nextSummaryRow + lastRowTemp - 2, 5)).Value = sourceFileName
-            End If
-        End If
-
-NextKey:
-    Next colCounter
-
-CleanUp:
-    If Not wbSource Is Nothing Then
-        wbSource.Close SaveChanges:=False
-    End If
-    Exit Sub
-
-ErrorHandler:
-    ' Continue processing other files if one fails
-    Resume CleanUp
-
 End Sub
 
 '==================================================================================================
@@ -393,11 +613,11 @@ Sub SaveSummaryToOutputFolder(ByVal wsSummary As Worksheet, ByVal outputPath As 
     
     ' Format the new worksheet
     With newWs
-        ' Update header range to include the new column E
-        .Range("A1:E1").Font.Bold = True
-        .Range("A1:E1").Interior.Color = RGB(200, 200, 200)
-        ' Update column autofit to include column E
-        .Columns("A:E").AutoFit
+        ' Update header range to include the new Source Folder column
+        .Range("A1:F1").Font.Bold = True
+        .Range("A1:F1").Interior.Color = RGB(200, 200, 200)
+        ' Update column autofit to include all columns
+        .Columns("A:F").AutoFit
     End With
     
     ' Generate filename with timestamp
@@ -423,6 +643,3 @@ SaveError:
     MsgBox "Error saving summary file: " & Err.Description, vbExclamation, "Save Error"
     
 End Sub
-
-
-
