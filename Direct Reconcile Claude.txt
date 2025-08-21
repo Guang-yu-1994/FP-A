@@ -307,9 +307,9 @@ Sub PasteFileDataToTempSheets(ByVal fullPath As String, ByVal wsTemp1 As Workshe
     End If
 
 CleanUp:
-    ' Store file read status
+    ' Store file read status - use Add with index only to avoid key conflicts
     On Error Resume Next
-    g_FileReadStatus.Add readStatus, fileName
+    g_FileReadStatus.Add readStatus & "|" & fileName
     On Error GoTo 0
     
     If Not wbSource Is Nothing Then
@@ -469,8 +469,8 @@ End Sub
 Sub LogFolderProcessToSheet1(ByVal folderName As String, ByVal processTime As Double)
     Dim ws1 As Worksheet
     Dim fileReadStatusText As String
-    Dim fileName As Variant
     Dim statusCount As Long
+    Dim i As Long
     
     On Error Resume Next
     Set ws1 = ThisWorkbook.Sheets("Sheet1")
@@ -491,14 +491,22 @@ Sub LogFolderProcessToSheet1(ByVal folderName As String, ByVal processTime As Do
                 .Columns("B:D").AutoFit
             End If
             
-            ' Generate file read status summary
-            statusCount = 0
+            ' Generate file read status summary - simplified approach
             fileReadStatusText = ""
-            For Each fileName In g_FileReadStatus
-                statusCount = statusCount + 1
-                If Len(fileReadStatusText) > 0 Then fileReadStatusText = fileReadStatusText & "; "
-                fileReadStatusText = fileReadStatusText & fileName & ":" & g_FileReadStatus(fileName)
-            Next fileName
+            On Error Resume Next
+            For i = 1 To g_FileReadStatus.Count
+                If i > 1 Then fileReadStatusText = fileReadStatusText & "; "
+                Dim statusParts() As String
+                statusParts = Split(g_FileReadStatus(i), "|")
+                If UBound(statusParts) >= 1 Then
+                    fileReadStatusText = fileReadStatusText & statusParts(1) & ":" & statusParts(0)
+                Else
+                    fileReadStatusText = fileReadStatusText & "File" & i & ":" & g_FileReadStatus(i)
+                End If
+            Next i
+            On Error GoTo 0
+            
+            If fileReadStatusText = "" Then fileReadStatusText = "No files processed"
             
             .Cells(g_LogNextRow, 2).Value = folderName
             .Cells(g_LogNextRow, 3).Value = Format(processTime, "0.00")
