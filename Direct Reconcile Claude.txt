@@ -1,3 +1,4 @@
+
 Option Explicit
 
 '==================================================================================================
@@ -5,6 +6,7 @@ Option Explicit
 '==================================================================================================
 Private g_TotalXlsFiles As Long
 Private g_TotalACTFolders As Long
+Private g_LogNextRow As Long ' New: To track the next row for logging in Sheet1
 
 '==================================================================================================
 ' Main Procedure: Keep original efficient logic, fix file reading issues
@@ -26,10 +28,15 @@ Sub Main_ProcessAllFiles()
     Dim outputPath As String
     Dim wsSummary As Worksheet
     Dim wsTemp As Worksheet
+    Dim startTime As Double ' New: To record processing start time
+    Dim endTime As Double   ' New: To record processing end time
 
     ' Initialize statistics
     g_TotalXlsFiles = 0
     g_TotalACTFolders = 0
+    
+    ' New: Initialize the log row for Sheet1 (starting from row 2, as row 1 is for general stats)
+    g_LogNextRow = 2
 
     Set fso = CreateObject("Scripting.FileSystemObject")
     basePath = ThisWorkbook.Path & "\" & ROOT_FOLDER_NAME
@@ -68,10 +75,19 @@ Sub Main_ProcessAllFiles()
                 If InStr(1, fileItem.Name, FILE_KEYWORD, vbTextCompare) > 0 And _
                    (LCase(fso.GetExtensionName(fileItem.Name)) = "xls" Or _
                     LCase(fso.GetExtensionName(fileItem.Name)) = "xlsx") Then
+                    
                     g_TotalXlsFiles = g_TotalXlsFiles + 1
                     
+                    startTime = Timer ' Record start time
+
                     ' Process single file - keep original efficient logic
-                    ProcessSingleFile fileItem.Path, wsSummary, wsTemp
+                    ' Pass the file name to ProcessSingleFile for logging
+                    ProcessSingleFile fileItem.Path, wsSummary, wsTemp, fileItem.Name
+                    
+                    endTime = Timer ' Record end time
+                    
+                    ' Log file name and processing time to Sheet1
+                    LogFileProcessToSheet1 fileItem.Name, endTime - startTime
                     
                     ' Memory cleanup
                     DoEvents
@@ -80,7 +96,7 @@ Sub Main_ProcessAllFiles()
         End If
     Next subFolder
 
-    ' Write statistics to Sheet1 A1 cell
+    ' Write general statistics to Sheet1 A1 cell
     WriteStatisticsToSheet1
 
     ' Save Summary Sheet as separate workbook
@@ -101,6 +117,8 @@ CleanUp:
     Set rootFolder = Nothing
     Set subFolder = Nothing
     Set fileItem = Nothing
+    Set wsSummary = Nothing
+    Set wsTemp = Nothing
     Exit Sub
 
 ErrorHandler:
@@ -110,7 +128,7 @@ ErrorHandler:
 End Sub
 
 '==================================================================================================
-' Write statistics to Sheet1 A1 cell
+' Write general statistics to Sheet1 A1 cell
 '==================================================================================================
 Sub WriteStatisticsToSheet1()
     Dim ws1 As Worksheet
@@ -122,12 +140,45 @@ Sub WriteStatisticsToSheet1()
     End If
     On Error GoTo 0
     
-    With ws1
-        .Cells(1, 1).Value = "Statistics: Processed " & g_TotalXlsFiles & " XLS files from " & g_TotalACTFolders & " ACT folders"
-        .Cells(1, 1).Font.Bold = True
-        .Cells(1, 1).Interior.Color = RGB(255, 255, 0)
-        .Columns("A:A").AutoFit
-    End With
+    If Not ws1 Is Nothing Then
+        With ws1
+            .Cells(1, 1).Value = "Statistics: Processed " & g_TotalXlsFiles & " XLS files from " & g_TotalACTFolders & " ACT folders"
+            .Cells(1, 1).Font.Bold = True
+            .Cells(1, 1).Interior.Color = RGB(255, 255, 0)
+            .Columns("A:A").AutoFit
+        End With
+    End If
+End Sub
+
+'==================================================================================================
+' New: Log file processing details to Sheet1
+'==================================================================================================
+Sub LogFileProcessToSheet1(ByVal fileName As String, ByVal processTime As Double)
+    Dim ws1 As Worksheet
+    
+    On Error Resume Next
+    Set ws1 = ThisWorkbook.Sheets("Sheet1")
+    If ws1 Is Nothing Then
+        Set ws1 = ThisWorkbook.Sheets(1)
+    End If
+    On Error GoTo 0
+    
+    If Not ws1 Is Nothing Then
+        With ws1
+            ' Ensure headers are present
+            If .Cells(1, 2).Value = "" Then
+                .Cells(1, 2).Value = "File Name"
+                .Cells(1, 3).Value = "Processing Time (seconds)"
+                .Range("B1:C1").Font.Bold = True
+                .Range("B1:C1").Interior.Color = RGB(200, 200, 200)
+                .Columns("B:C").AutoFit
+            End If
+            
+            .Cells(g_LogNextRow, 2).Value = fileName
+            .Cells(g_LogNextRow, 3).Value = Format(processTime, "0.00") ' Format to 2 decimal places
+            g_LogNextRow = g_LogNextRow + 1
+        End With
+    End If
 End Sub
 
 '==================================================================================================
@@ -151,19 +202,20 @@ Sub SetupWorksheets(ByRef wsSummary As Worksheet, ByRef wsTemp As Worksheet)
     wsSummary.Cells.Clear
     On Error GoTo 0
 
-    ' Create header row
+    ' Create header row for Summary Sheet
     With wsSummary
         .Cells(1, 1).Value = "Submission Date"
         .Cells(1, 2).Value = "Account #"
         .Cells(1, 3).Value = "Expire Date"
         .Cells(1, 4).Value = "Amount"
+        .Cells(1, 5).Value = "Source Name" ' New: Added Source Name column
     End With
 End Sub
 
 '==================================================================================================
 ' Original efficient processing logic with improved file opening
 '==================================================================================================
-Sub ProcessSingleFile(ByVal fullPath As String, ByVal wsSummary As Worksheet, ByVal wsTemp As Worksheet)
+Sub ProcessSingleFile(ByVal fullPath As String, ByVal wsSummary As Worksheet, ByVal wsTemp As Worksheet, ByVal sourceFileName As String)
 
     Dim wbSource As Workbook
     Dim wsSource As Worksheet
@@ -242,6 +294,9 @@ Sub ProcessSingleFile(ByVal fullPath As String, ByVal wsSummary As Worksheet, By
                 wsTemp.Range("A2:A" & lastRowTemp).Copy
                 wsSummary.Cells(nextSummaryRow, tempColOffset).PasteSpecial xlPasteValuesAndNumberFormats
                 Application.CutCopyMode = False
+                
+                ' New: Fill the "Source Name" column for the newly added rows
+                wsSummary.Range(wsSummary.Cells(nextSummaryRow, 5), wsSummary.Cells(nextSummaryRow + lastRowTemp - 2, 5)).Value = sourceFileName
             End If
         End If
 
@@ -279,7 +334,7 @@ Function OpenFileCleanly(ByVal fullPath As String) As Workbook
     
     ' Method 1: Try opening with minimal parameters to reduce corruption warnings
     Set wb = Application.Workbooks.Open( _
-        Filename:=fullPath, _
+        fileName:=fullPath, _
         ReadOnly:=True, _
         UpdateLinks:=False, _
         AddToMru:=False _
@@ -298,7 +353,7 @@ Function OpenFileCleanly(ByVal fullPath As String) As Workbook
     ' Method 2: If first method fails, try with notification off
     Application.DisplayAlerts = False
     Set wb = Application.Workbooks.Open( _
-        Filename:=fullPath, _
+        fileName:=fullPath, _
         ReadOnly:=True _
     )
     Application.DisplayAlerts = True
@@ -330,17 +385,19 @@ Sub SaveSummaryToOutputFolder(ByVal wsSummary As Worksheet, ByVal outputPath As 
     newWs.Name = "Reconciliation Summary"
     
     ' Copy all data from summary sheet
-    If wsSummary.UsedRange.Rows.Count > 0 Then
-        wsSummary.UsedRange.Copy
+    If wsSummary.usedRange.Rows.Count > 0 Then
+        wsSummary.usedRange.Copy
         newWs.Range("A1").PasteSpecial xlPasteValuesAndNumberFormats
         Application.CutCopyMode = False
     End If
     
     ' Format the new worksheet
     With newWs
-        .Range("A1:D1").Font.Bold = True
-        .Range("A1:D1").Interior.Color = RGB(200, 200, 200)
-        .Columns("A:D").AutoFit
+        ' Update header range to include the new column E
+        .Range("A1:E1").Font.Bold = True
+        .Range("A1:E1").Interior.Color = RGB(200, 200, 200)
+        ' Update column autofit to include column E
+        .Columns("A:E").AutoFit
     End With
     
     ' Generate filename with timestamp
@@ -366,3 +423,6 @@ SaveError:
     MsgBox "Error saving summary file: " & Err.Description, vbExclamation, "Save Error"
     
 End Sub
+
+
+
