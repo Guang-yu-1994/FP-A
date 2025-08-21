@@ -1,0 +1,11 @@
+Sub DiagnosticTest()
+    Dim fso As Object
+    Dim basePath As String
+    
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    basePath = ThisWorkbook.Path & "\DirectSale Reconcile Inputs"
+    
+    MsgBox "Workbook Path: " & ThisWorkbook.Path & vbCrLf & _
+           "Input Folder: " & basePath & vbCrLf & _
+           "Folder Exists: " & fso.FolderExists(basePath), vbInformation, "Diagnostic"
+End Sub
