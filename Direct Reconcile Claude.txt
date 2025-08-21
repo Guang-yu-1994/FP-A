@@ -64,10 +64,22 @@ Sub Main_ProcessAllFiles()
     On Error GoTo ErrorHandler
 
     ' Setup worksheets
+    On Error Resume Next
     SetupWorksheets wsSummary, wsTemp
+    If Err.Number <> 0 Then
+        MsgBox "Error setting up worksheets: " & Err.Description, vbCritical, "Setup Error"
+        GoTo CleanUp
+    End If
+    On Error GoTo ErrorHandler
     
     ' Initialize debug logging
+    On Error Resume Next
     InitializeDebugLog
+    If Err.Number <> 0 Then
+        g_DebugMode = False ' Disable debug mode if it fails
+        MsgBox "Warning: Debug logging disabled due to error: " & Err.Description, vbExclamation, "Debug Warning"
+    End If
+    On Error GoTo ErrorHandler
 
     Set rootFolder = fso.GetFolder(basePath)
 
@@ -112,12 +124,24 @@ Sub Main_ProcessAllFiles()
     Next subFolder
 
     ' Write final statistics
+    On Error Resume Next
     WriteStatisticsToSheet1 Timer - totalStartTime
+    If Err.Number <> 0 Then
+        MsgBox "Warning: Could not write statistics: " & Err.Description, vbExclamation, "Statistics Warning"
+    End If
+    On Error GoTo ErrorHandler
 
     ' Save Summary Sheet as separate workbook
+    On Error Resume Next
     SaveSummaryToOutputFolder wsSummary, outputPath
+    If Err.Number <> 0 Then
+        MsgBox "Warning: Could not save summary file: " & Err.Description, vbExclamation, "Save Warning"
+    End If
+    On Error GoTo ErrorHandler
     
+    On Error Resume Next
     LogDebug "Total processing time: " & Format(Timer - totalStartTime, "0.00") & " seconds"
+    On Error GoTo ErrorHandler
 
     MsgBox "All data processing complete!" & vbCrLf & _
            "Processed " & g_TotalXlsFiles & " XLS files" & vbCrLf & _
@@ -141,8 +165,12 @@ CleanUp:
     Exit Sub
 
 ErrorHandler:
-    LogDebug "CRITICAL ERROR in main procedure: " & Err.Description & " (Error " & Err.Number & ")"
-    MsgBox "Error in main procedure: " & Err.Description, vbCritical, "Error"
+    On Error Resume Next
+    If g_DebugMode Then
+        LogDebug "CRITICAL ERROR in main procedure: " & Err.Description & " (Error " & Err.Number & ")"
+    End If
+    On Error GoTo 0
+    MsgBox "Error in main procedure: " & Err.Description & vbCrLf & "Error Number: " & Err.Number, vbCritical, "Error"
     Resume CleanUp
 
 End Sub
