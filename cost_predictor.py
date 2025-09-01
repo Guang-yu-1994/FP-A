@@ -10,14 +10,21 @@ class CostPredictor:
     """
     Guide&Coord Prediction Class
     增加了将周级别数据拆分到日级别并汇总到月级别的功能。
+    增加了时间级别参数，如果传入'weekly'，则从 INPUT_DIR/Weekly 文件夹读取收入数据；
+    如果传入'daily'，则从 INPUT_DIR/Daily 文件夹读取收入数据。
     """
 
-    def __init__(self):
+    def __init__(self, time_level='weekly'):
         # 设置基础目录和输入/输出路径
         self.BASE_DIR = os.path.dirname(os.path.abspath(__file__))
         self.INPUT_DIR = os.path.join(self.BASE_DIR, 'Revenue Outputs')
         self.OUTPUT_DIR = os.path.join(self.BASE_DIR, 'Cost Outputs')
         self.PUBLIC_DIR = r"C:\City Experience\Public Data Base"
+
+        # 时间级别参数
+        self.time_level = time_level.lower()
+        if self.time_level not in ['weekly', 'daily']:
+            raise ValueError("time_level must be 'weekly' or 'daily'")
 
         # 设置日志
         logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -28,7 +35,7 @@ class CostPredictor:
 
         # 数据存储
         self.model_parameters = None
-        self.weekly_revenue = None
+        self.revenue_data = None  # 修改：统一为 revenue_data
         self.cogs_data = None  # 存储周级别的COGS预测数据
         self.daily_cogs_data = None  # 新增：存储日级别的COGS数据
         self.monthly_cogs_summary = None  # 新增：存储月级别的COGS汇总数据
@@ -64,11 +71,12 @@ class CostPredictor:
             self.logger.error(f"读取模型参数数据失败: {e}")
             raise Exception(f"读取模型参数数据失败: {e}")
 
-    def prepare_weekly_revenue(self):
-        """准备周收入数据。"""
-        self.logger.info("正在准备周收入数据...")
+    def prepare_revenue_data(self):
+        """准备收入数据，根据 time_level 从不同子文件夹读取。"""
+        self.logger.info(f"正在准备{self.time_level}收入数据...")
 
-        excel_path = os.path.join(self.INPUT_DIR, 'sales_revenue_prediction.xlsx')
+        sub_dir = 'Weekly' if self.time_level == 'weekly' else 'Daily'
+        excel_path = os.path.join(self.INPUT_DIR, sub_dir, 'sales_revenue_prediction.xlsx')
         try:
             df = pd.read_excel(excel_path, sheet_name='Revenue_Prediction')
 
@@ -76,15 +84,15 @@ class CostPredictor:
             df['Event Date'] = pd.to_datetime(df['Event Date'])
 
             # 按 Currency 和 Event Date 聚合 Revenue
-            weekly_revenue = df.groupby(['Currency', 'Event Date'], as_index=False)['Revenue'].sum()
+            revenue_data = df.groupby(['Currency', 'Event Date'], as_index=False)['Revenue'].sum()
 
-            self.logger.info(f"成功准备周收入数据，共{len(weekly_revenue)}行数据")
+            self.logger.info(f"成功准备{self.time_level}收入数据，共{len(revenue_data)}行数据")
             self.logger.info(
-                f"日期范围: {weekly_revenue['Event Date'].min().date()} 到 {weekly_revenue['Event Date'].max().date()}")
-            self.logger.info(f"总收入: {weekly_revenue['Revenue'].sum():,.2f}")
+                f"日期范围: {revenue_data['Event Date'].min().date()} 到 {revenue_data['Event Date'].max().date()}")
+            self.logger.info(f"总收入: {revenue_data['Revenue'].sum():,.2f}")
 
-            self.weekly_revenue = weekly_revenue
-            return weekly_revenue
+            self.revenue_data = revenue_data
+            return revenue_data
 
         except Exception as e:
             self.logger.error(f"读取销售收入预测数据失败: {e}")
@@ -154,12 +162,12 @@ class CostPredictor:
         """
         self.logger.info("正在准备COGS数据...")
 
-        if self.weekly_revenue is None or self.model_parameters is None:
-            raise Exception("请先准备weekly_revenue和model_parameters数据")
+        if self.revenue_data is None or self.model_parameters is None:
+            raise Exception("请先准备revenue_data和model_parameters数据")
 
-        # 1. 左连接 weekly_revenue 和 model_parameters，连接键为 Currency
+        # 1. 左连接 revenue_data 和 model_parameters，连接键为 Currency
         merged_df = pd.merge(
-            self.weekly_revenue,
+            self.revenue_data,
             self.model_parameters,
             on='Currency',
             how='left'
@@ -209,116 +217,65 @@ class CostPredictor:
         else:
             missing_cols = [col for col in required_cols_for_adj if col not in merged_df.columns]
             self.logger.warning(f"无法计算 AP adj，因为缺少以下列: {missing_cols}")
-        # --- AP adj 新逻辑结束 ---
 
-        # 4. 计算 Guide Payment Date
-        merged_df['Guide Payment Date'] = merged_df.apply(
-            self.calculate_guide_payment_date, axis=1
-        )
+        # 计算付款日期
+        self.logger.info("正在计算付款日期...")
+        merged_df['Guide Payment Date'] = merged_df.apply(self.calculate_guide_payment_date, axis=1)
+        merged_df['AP Payment Date'] = merged_df.apply(self.calculate_ap_payment_date, axis=1)
+        merged_df['CF Payment Date'] = merged_df.apply(self.calculate_cf_payment_date, axis=1)
 
-        # 5. 计算 AP Payment Date
-        merged_df['AP Payment Date'] = merged_df.apply(
-            self.calculate_ap_payment_date, axis=1
-        )
+        # 排序数据
+        merged_df = merged_df.sort_values(['Currency', 'Event Date'])
 
-        # 检查是否有未计算付款日期的记录
-        null_guide_payment_dates = merged_df['Guide Payment Date'].isnull().sum()
-        if null_guide_payment_dates > 0:
-            self.logger.warning(f"有{null_guide_payment_dates}条记录无法计算Guide付款日期")
+        # 选择最终列
+        final_columns = ['Currency', 'Event Date', 'Revenue'] + prediction_columns + \
+                        ['Guide Payment Date', 'AP Payment Date', 'CF Payment Date']
+        self.cogs_data = merged_df[final_columns]
 
-        null_ap_payment_dates = merged_df['AP Payment Date'].isnull().sum()
-        if null_ap_payment_dates > 0:
-            self.logger.warning(f"有{null_ap_payment_dates}条记录无法计算AP付款日期")
+        self.logger.info(f"COGS数据准备完成，共{len(self.cogs_data)}行数据")
+        self.logger.info(f"包含预测列: {prediction_columns}")
 
-        self.logger.info("COGS数据准备完成")
-
-        # 打印动态添加列的总预测
-        for pred_col in prediction_columns:
-            if pred_col in merged_df:
-                self.logger.info(f"{pred_col} 总预测: {merged_df[pred_col].sum():,.2f}")
-
-        self.cogs_data = merged_df
-        return merged_df
+        return self.cogs_data
 
     def resample_to_daily_and_monthly(self):
         """
-        将周级别数据拆分到日级别并平均，然后汇总到月级别。
+        将周级别数据拆分到日级别并汇总到月级别。
+        如果 time_level 为 'daily'，则直接使用 cogs_data 作为 daily_cogs_data。
         """
-        self.logger.info("正在将周级别数据拆分到日级别并汇总到月级别...")
-
         if self.cogs_data is None:
-            raise Exception("没有COGS数据，无法进行日级别拆分。请先运行 prepare_cogs_data。")
+            raise Exception("请先准备COGS数据")
 
-        # 1. 筛选所需列，这些列将进行平均分配
-        # Currency 列不变，Event Date 变为每天的日期，其余列进行平均
-        # 已将 'AP COGS' 更新为 'COGS exc Guide&Coord'
-        selected_columns = ['Currency', 'Event Date', 'Revenue', 'Guide&Coord', 'COGS exc Guide&Coord', 'AP', 'CF', 'AP adj'] # 更新了列名
-        df_weekly = self.cogs_data[selected_columns].copy()
+        if self.time_level == 'daily':
+            self.logger.info("时间级别为 'daily'，直接使用现有数据作为日级别数据。")
+            self.daily_cogs_data = self.cogs_data.copy()
+        else:  # weekly
+            self.logger.info("时间级别为 'weekly'，将周级别数据拆分到日级别...")
+            # 假设每周数据均匀分布到7天
+            daily_rows = []
+            for _, row in self.cogs_data.iterrows():
+                start_date = row['Event Date']
+                for i in range(7):
+                    daily_date = start_date + timedelta(days=i)
+                    daily_row = row.copy()
+                    daily_row['Event Date'] = daily_date
+                    # 数值列除以7
+                    for col in self.cogs_data.columns:
+                        if pd.api.types.is_numeric_dtype(self.cogs_data[col]) and col not in ['Event Date', 'Guide Payment Date', 'AP Payment Date', 'CF Payment Date']:
+                            daily_row[col] /= 7
+                    daily_rows.append(daily_row)
+            self.daily_cogs_data = pd.DataFrame(daily_rows)
+            self.daily_cogs_data = self.daily_cogs_data.sort_values(['Currency', 'Event Date'])
+            self.logger.info(f"日级别数据拆分完成，共{len(self.daily_cogs_data)}行数据")
 
-        daily_records = []
-        # 2. 遍历周数据，拆分到日，并平均
-        for index, row in df_weekly.iterrows():
-            week_start_date = row['Event Date']
-            # 确保 Event Date 是 datetime 类型
-            if not isinstance(week_start_date, pd.Timestamp):
-                week_start_date = pd.to_datetime(week_start_date)
-
-            # 计算这一周的7天日期 (从周一开始)
-            week_dates = [week_start_date + timedelta(days=i) for i in range(7)]
-
-            # 计算需要平均的数值列的每日平均值
-            # 假设每周有7天，将周总额平均到每天
-            num_days_in_week = 7
-            avg_revenue = row['Revenue'] / num_days_in_week
-            avg_guide_coord = row['Guide&Coord'] / num_days_in_week
-            avg_cogs_exc_guide_coord = row['COGS exc Guide&Coord'] / num_days_in_week # 更新了变量名
-            avg_ap = row['AP'] / num_days_in_week
-            avg_cf = row['CF'] / num_days_in_week
-            avg_ap_adj = row['AP adj'] / num_days_in_week
-
-            for day_date in week_dates:
-                daily_records.append({
-                    'Currency': row['Currency'],
-                    'Event Date': day_date,  # 这里是每一天的日期
-                    'Revenue': avg_revenue,
-                    'Guide&Coord': avg_guide_coord,
-                    'COGS exc Guide&Coord': avg_cogs_exc_guide_coord, # 更新了列名
-                    'AP': avg_ap,
-                    'CF': avg_cf,
-                    'AP adj': avg_ap_adj
-                })
-
-        # 创建日级别 DataFrame
-        df_daily = pd.DataFrame(daily_records)
-        # 确保 Event Date 是日期时间类型，以便后续操作
-        df_daily['Event Date'] = pd.to_datetime(df_daily['Event Date'])
-
-        # 3. 新建 StartOfMonth 列
-        # 使用 .dt.to_period('M') 获取月份周期，再用 .dt.start_time 获取该月的第一个日期
-        df_daily['StartOfMonth'] = df_daily['Event Date'].dt.to_period('M').dt.start_time
-
-        self.logger.info(f"日级别数据拆分完成，共 {len(df_daily)} 行。")
-
-        # 4. 聚合为月级别数据
-        # 定义需要求和的列
-        # 已将 'AP COGS' 更新为 'COGS exc Guide&Coord'
-        sum_cols = ['Revenue', 'Guide&Coord', 'COGS exc Guide&Coord', 'AP', 'CF', 'AP adj'] # 更新了列名
-        # 按 Currency 和 StartOfMonth 进行分组，并对指定列求和
-        monthly_summary = df_daily.groupby(['Currency', 'StartOfMonth'])[sum_cols].sum().reset_index()
-
-        self.logger.info(f"月级别数据汇总完成，共 {len(monthly_summary)} 行。")
-
-        # 将结果存储到类属性中
-        self.daily_cogs_data = df_daily
-        self.monthly_cogs_summary = monthly_summary
-
-        return df_daily, monthly_summary
+        # 汇总到月级别（统一处理）
+        self.logger.info("正在汇总到月级别...")
+        self.daily_cogs_data['StartOfMonth'] = self.daily_cogs_data['Event Date'].dt.to_period('M').dt.to_timestamp()
+        monthly_agg = self.daily_cogs_data.groupby(['Currency', 'StartOfMonth']).sum(numeric_only=True).reset_index()
+        self.monthly_cogs_summary = monthly_agg
+        self.logger.info(f"月级别汇总完成，共{len(self.monthly_cogs_summary)}行数据")
 
     def create_guide_cogs_pivot(self):
-        """
-        创建 COGS_Generated_from_Revenue 的透视表，以 Currency 为索引，
-        Guide Payment Date 为列，Guide&Coord 为值。
-        """
+        """创建 Guide&Coord COGS 透视表，按 Guide Payment Date 列透视。"""
         self.logger.info("正在创建 Guide&Coord COGS 透视表...")
         if self.cogs_data is None:
             raise Exception("没有COGS数据，无法创建透视表。请先运行 prepare_cogs_data。")
@@ -360,7 +317,7 @@ class CostPredictor:
         output_path = os.path.join(self.OUTPUT_DIR, filename)
 
         with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
-            # 保存原始周级别预测数据
+            # 保存原始预测数据（如果是 weekly，则是周级别；如果是 daily，则是日级别，但统一保存到 Cost_Predictions）
             self.cogs_data.to_excel(writer, sheet_name='Cost_Predictions', index=False)
             self.logger.info(f"数据已保存到 '{output_path}' 的 'Cost_Predictions' 工作表。")
 
@@ -369,10 +326,10 @@ class CostPredictor:
                 self.model_parameters.to_excel(writer, sheet_name='Model_Parameters_Used', index=False)
                 self.logger.info(f"数据已保存到 '{output_path}' 的 'Model_Parameters_Used' 工作表。")
 
-            # 保存周收入输入数据
-            if self.weekly_revenue is not None:
-                self.weekly_revenue.to_excel(writer, sheet_name='Weekly_Revenue_Input', index=False)
-                self.logger.info(f"数据已保存到 '{output_path}' 的 'Weekly_Revenue_Input' 工作表。")
+            # 保存收入输入数据
+            if self.revenue_data is not None:
+                self.revenue_data.to_excel(writer, sheet_name='Revenue_Input', index=False)
+                self.logger.info(f"数据已保存到 '{output_path}' 的 'Revenue_Input' 工作表。")
 
             # 保存 Guide COGS 透视表
             if self.guide_cogs_pivot is not None and not self.guide_cogs_pivot.empty:
@@ -465,8 +422,8 @@ class CostPredictor:
         try:
             # 1. 准备所有数据
             self.prepare_model_parameters()
-            self.prepare_weekly_revenue()
-            self.prepare_cogs_data()  # 这一步会生成 self.cogs_data (周级别数据)
+            self.prepare_revenue_data()
+            self.prepare_cogs_data()  # 这一步会生成 self.cogs_data (根据 time_level 是周或日级别数据)
 
             # 新增：调用拆分和汇总方法，生成日级别和月级别数据
             self.resample_to_daily_and_monthly()
@@ -481,7 +438,7 @@ class CostPredictor:
             self.get_summary_by_currency()
             self.get_summary_by_payment_date()
 
-            self.logger.info("\n成本预测流程完成！")
+            self.logger.info("\n\n成本预测流程完成！")
             self.logger.info(f"- 总记录数: {len(self.cogs_data)}")
             self.logger.info(f"- 货币种类: {self.cogs_data['Currency'].nunique()}")
             self.logger.info(
@@ -496,13 +453,13 @@ class CostPredictor:
 
 # 示例用法
 if __name__ == "__main__":
-    # 创建预测器实例
-    predictor = CostPredictor()
+    # 创建预测器实例，可以指定 time_level
+    predictor = CostPredictor(time_level='weekly')  # 或 'daily'
 
     # 运行完整的预测
     try:
         result = predictor.run_full_prediction()
-        print("\n前5行周级别结果:")
+        print("\n前5行结果:")
         print(result.head().to_string())
 
         if predictor.daily_cogs_data is not None:
