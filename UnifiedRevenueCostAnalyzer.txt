@@ -1,0 +1,1195 @@
+import os
+import pandas as pd
+from datetime import datetime, timedelta
+import logging
+import numpy as np
+import statsmodels.api as sm
+import matplotlib.pyplot as plt
+import openpyxl
+from typing import List, Dict, Optional, Tuple
+
+class UnifiedRevenueCostAnalyzer:
+    """
+    Unified Revenue and Cost Analyzer class
+    Combines the functionality of WeeklyRevenueDataProcessor, WeeklyCostExport, 
+    RevenueAnalyzeBaseData, and EnhancedCostRevenueAnalyzer.
+    Processes weekly revenue data, weekly cost export, prepares base data for revenue analysis,
+    and performs enhanced cost-revenue analysis with linear modeling.
+    """
+
+    def __init__(self, base_dir: Optional[str] = None):
+        # Set base directory and paths (from WeeklyRevenueDataProcessor and others)
+        if base_dir is None:
+            self.BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+        else:
+            self.BASE_DIR = base_dir
+        self.INPUT_DIR = os.path.join(self.BASE_DIR, 'Revenue Inputs')
+        self.OUTPUT_DIR = os.path.join(self.BASE_DIR, 'Revenue Outputs')
+        self.Public_DIR = r"C:\City Experience\Public Data Base"  # User has moved file to this directory
+
+        # Set up logging (from WeeklyCostExport)
+        logging.basicConfig(level=logging.INFO)
+        self.logger = logging.getLogger(__name__)
+
+        # Ensure directories exist
+        os.makedirs(self.INPUT_DIR, exist_ok=True)
+        os.makedirs(self.OUTPUT_DIR, exist_ok=True)
+        os.makedirs(self.Public_DIR, exist_ok=True)
+
+        # From WeeklyRevenueDataProcessor
+        self.required_columns = ['Event Date', 'Tour ID', 'Event Name', 'Currency']
+        self.groupby_columns = ['StartOfWeek', 'Tour ID', 'Event Name', 'Currency']
+        self.original_data = None
+        self.weekly_summary = None
+        self.numeric_columns = []
+
+        # From EnhancedCostRevenueAnalyzer
+        self.cost_columns = [
+            'CF',
+            'AP',
+            'Guide&Coord',
+            'COGS exc Guide&Coord'  # Updated column name
+        ]
+        self.revenue_column = 'Gross Revenue Local'
+        self.currency_column = 'Currency'
+        self.model_parameters = {}
+        self.df = None  # For aggregated data in analysis
+
+    # Methods from WeeklyRevenueDataProcessor
+    def get_start_of_week(self, date) -> Optional[datetime.date]:
+        """
+        Get the Monday date of the week for a given date
+
+        Args:
+            date: date object
+
+        Returns:
+            Monday date
+        """
+        if pd.isna(date):
+            return None
+
+        # Ensure it is a datetime object
+        if isinstance(date, str):
+            date = pd.to_datetime(date)
+
+        # Calculate Monday date (weekday() returns 0-6, 0 is Monday)
+        days_since_monday = date.weekday()
+        start_of_week = date - timedelta(days=days_since_monday)
+        return start_of_week.date()
+
+    def is_numeric_column(self, series: pd.Series) -> bool:
+        """
+        判断一个Series是否为数值型数据
+
+        Args:
+            series: 要检查的pandas Series
+
+        Returns:
+            True如果是数值型，False否则
+        """
+        # 排除空值
+        non_null_series = series.dropna()
+
+        if len(non_null_series) == 0:
+            return False
+
+        # 检查是否为数值类型
+        return pd.api.types.is_numeric_dtype(non_null_series)
+
+    def load_revenue_data(self, filename: str = 'Revenue Basic Data.xlsx',
+                          sheet_name: str = 'Revenue Data',
+                          read_from_excel: bool = True) -> bool:
+        """
+        加载数据文件，可选从Excel或CSV读取。
+        如果从Excel读取，则同时保存为CSV格式。
+
+        Args:
+            filename: 输入文件名 (Excel文件名)
+            sheet_name: 工作表名称
+            read_from_excel (bool): 如果为True，则从Excel读取并保存为CSV；
+                                    如果为False，则直接从CSV读取。
+
+        Returns:
+            True如果加载成功，False否则
+        """
+        # 假设CSV文件名基于Excel文件名，但扩展名为.csv
+        csv_filename = 'Revenue Basic Data.csv'
+
+        excel_file_path = os.path.join(self.INPUT_DIR, filename)
+        csv_file_path = os.path.join(self.INPUT_DIR, csv_filename)
+
+        try:
+            if read_from_excel:
+                self.logger.info(f"选择从Excel重新读取。正在读取文件: {excel_file_path}")
+                if not os.path.exists(excel_file_path):
+                    self.logger.error(f"错误：找不到Excel文件 {excel_file_path}")
+                    return False
+
+                self.original_data = pd.read_excel(excel_file_path, sheet_name=sheet_name)
+                self.logger.info(f"成功从Excel读取数据，共 {len(self.original_data)} 行")
+
+                # 读取后在同个文件夹输出CSV格式
+                self.logger.info(f"正在将数据保存为CSV格式: {csv_file_path}")
+                self.original_data.to_csv(csv_file_path, index=False, encoding='utf-8')
+                self.logger.info("CSV文件保存成功。")
+            else:
+                self.logger.info(f"选择从CSV读取。正在读取文件: {csv_file_path}")
+                if not os.path.exists(csv_file_path):
+                    self.logger.error(f"错误：找不到CSV文件 {csv_file_path}。请先运行一次从Excel读取的模式。")
+                    return False
+
+                self.original_data = pd.read_csv(csv_file_path, encoding='utf-8')
+                self.logger.info(f"成功从CSV读取数据，共 {len(self.original_data)} 行")
+
+            return True
+
+        except FileNotFoundError:
+            self.logger.error(f"错误：文件操作失败，请检查文件路径和名称。")
+            return False
+        except Exception as e:
+            self.logger.error(f"读取或保存文件时发生错误: {str(e)}")
+            return False
+
+    def validate_revenue_data(self) -> bool:
+        """
+        验证数据是否包含必要的列
+
+        Returns:
+            True如果验证通过，False否则
+        """
+        if self.original_data is None:
+            self.logger.error("错误：尚未加载数据")
+            return False
+
+        missing_columns = [col for col in self.required_columns
+                           if col not in self.original_data.columns]
+
+        if missing_columns:
+            self.logger.error(f"错误：缺少必要的列: {missing_columns}")
+            self.logger.info(f"可用的列: {list(self.original_data.columns)}")
+            return False
+
+        return True
+
+    def prepare_revenue_data(self) -> bool:
+        """
+        准备数据：添加StartOfWeek列，识别数值型列
+
+        Returns:
+            True如果准备成功，False否则
+        """
+        if not self.validate_revenue_data():
+            return False
+
+        try:
+            # 添加StartOfWeek列
+            self.logger.info("正在添加StartOfWeek列...")
+            self.original_data['Event Date'] = pd.to_datetime(self.original_data['Event Date'])
+            self.original_data['StartOfWeek'] = self.original_data['Event Date'].apply(self.get_start_of_week)
+
+            # 识别数值型列
+            self.logger.info("正在识别数值型列...")
+            self.numeric_columns = []
+
+            for col in self.original_data.columns:
+                if col not in self.groupby_columns and col != 'Event Date':
+                    if self.is_numeric_column(self.original_data[col]):
+                        self.numeric_columns.append(col)
+                        self.logger.info(f"  - 数值型列: {col}")
+                    else:
+                        self.logger.info(f"  - 非数值型列: {col} (将被忽略)")
+
+            if not self.numeric_columns:
+                self.logger.warning("警告：没有找到可聚合的数值型列")
+                return False
+
+            return True
+
+        except Exception as e:
+            self.logger.error(f"准备数据时发生错误: {str(e)}")
+            return False
+
+    def aggregate_revenue_data(self) -> bool:
+        """
+        执行数据聚合
+
+        Returns:
+            True如果聚合成功，False否则
+        """
+        if not self.numeric_columns:
+            self.logger.error("错误：没有可聚合的数值型列")
+            return False
+
+        try:
+            self.logger.info("正在进行分组聚合...")
+
+            # 准备聚合字典
+            agg_dict = {col: 'sum' for col in self.numeric_columns}
+
+            # 执行分组聚合
+            self.weekly_summary = self.original_data.groupby(self.groupby_columns).agg(agg_dict).reset_index()
+
+            # 添加记录计数
+            event_counts = self.original_data.groupby(self.groupby_columns).size().reset_index(name='Event_Count')
+            self.weekly_summary = self.weekly_summary.merge(event_counts, on=self.groupby_columns)
+
+            # 排序
+            self.weekly_summary = self.weekly_summary.sort_values(['StartOfWeek', 'Tour ID', 'Event Name', 'Currency'])
+
+            self.logger.info(f"聚合完成，共生成 {len(self.weekly_summary)} 行周度汇总数据")
+            return True
+
+        except Exception as e:
+            self.logger.error(f"聚合数据时发生错误: {str(e)}")
+            return False
+
+    def save_revenue_results(self, output_filename: str = 'Weekly_Revenue_Data.xlsx') -> bool:
+        """
+        保存结果到Excel文件
+
+        Args:
+            output_filename: 输出文件名
+
+        Returns:
+            True如果保存成功，False否则
+        """
+        if self.original_data is None or self.weekly_summary is None:
+            self.logger.error("错误：没有数据可保存")
+            return False
+
+        try:
+            output_file = os.path.join(self.OUTPUT_DIR, output_filename)
+
+            with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
+                # 保存原始数据（带StartOfWeek列）
+                self.original_data.to_excel(writer, sheet_name='Original_Data_with_StartOfWeek', index=False)
+
+                # 保存周度汇总数据
+                self.weekly_summary.to_excel(writer, sheet_name='Weekly_Summary', index=False)
+
+            self.logger.info(f"结果已保存到: {output_file}")
+            return True
+
+        except Exception as e:
+            self.logger.error(f"保存文件时发生错误: {str(e)}")
+            return False
+
+    def process_weekly_revenue_data(self, input_filename: str = 'Revenue Basic Data.xlsx',
+                                    sheet_name: str = 'Revenue Data',
+                                    output_filename: str = 'Weekly_Revenue_Data.xlsx',
+                                    read_from_excel: bool = True) -> bool:
+        """
+        执行完整的处理流程，并提供是否重新读入Excel的选项。
+
+        Args:
+            input_filename: 输入文件名 (Excel文件名)
+            sheet_name: 工作表名称
+            output_filename: 输出文件名
+            read_from_excel (bool): 如果为True，则从Excel读取并保存为CSV；
+                                    如果为False，则直接从CSV读取。
+
+        Returns:
+            True如果处理成功，False否则
+        """
+        self.logger.info("开始处理Weekly Revenue Data...")
+
+        # 加载数据 (根据read_from_excel参数)
+        if not self.load_revenue_data(input_filename, sheet_name, read_from_excel=read_from_excel):
+            return False
+
+        # 准备数据
+        if not self.prepare_revenue_data():
+            return False
+
+        # 聚合数据
+        if not self.aggregate_revenue_data():
+            return False
+
+        # 保存结果
+        if not self.save_revenue_results(output_filename):
+            return False
+
+        self.logger.info("Weekly Revenue Data 处理完成！")
+        return True
+
+    # Methods from WeeklyCostExport
+    def load_cost_export_data(self, read_from_excel: bool = True):
+        """
+        Reads Cost Export data, optionally from Excel or CSV.
+        If reading from Excel, it will also be saved in CSV format.
+
+        Args:
+            read_from_excel (bool): If True, read from Excel and save as CSV;
+                                    If False, read directly from CSV.
+
+        Returns:
+            DataFrame: Original data
+        """
+        excel_filename = 'Costs Export.xlsx'
+        excel_sheet_name = 'Cost Export'
+        csv_filename = 'AP Prediction_Cost_Export.csv'  # Define CSV filename
+
+        excel_file_path = os.path.join(self.Public_DIR, excel_filename)
+        csv_file_path = os.path.join(self.Public_DIR, csv_filename)
+
+        df = None
+        try:
+            if read_from_excel:
+                self.logger.info(f"Choosing to re-read from Excel. Reading file: {excel_file_path}")
+                # Ensure Excel file exists
+                if not os.path.exists(excel_file_path):
+                    raise FileNotFoundError(f"Excel file not found: {excel_file_path}")
+
+                df = pd.read_excel(excel_file_path, sheet_name=excel_sheet_name)
+                self.logger.info(f"Successfully read data from Excel, total {len(df)} rows")
+
+                # After reading, output in CSV format in the same folder
+                self.logger.info(f"Saving data in CSV format: {csv_file_path}")
+                df.to_csv(csv_file_path, index=False, encoding='utf-8')
+                self.logger.info("CSV file saved successfully.")
+            else:
+                self.logger.info(f"Choosing to read from CSV. Reading file: {csv_file_path}")
+                # Ensure CSV file exists
+                if not os.path.exists(csv_file_path):
+                    raise FileNotFoundError(f"CSV file not found: {csv_file_path}. Please run in Excel read mode first.")
+
+                df = pd.read_csv(csv_file_path, encoding='utf-8')
+                self.logger.info(f"Successfully read data from CSV, total {len(df)} rows")
+
+            return df
+
+        except FileNotFoundError as e:
+            self.logger.error(f"File operation error: {str(e)}")
+            raise
+        except Exception as e:
+            self.logger.error(f"Error reading or saving file: {str(e)}")
+            raise
+
+    def identify_numeric_columns(self, df):
+        """
+        Identifies numeric columns in a DataFrame
+
+        Args:
+            df: DataFrame
+
+        Returns:
+            list: List of numeric column names
+        """
+        numeric_columns = []
+
+        # Define non-data columns that do not need to be checked
+        non_numeric_cols_to_skip = ['StartOfWeek', 'Event Date', 'Event ID', 'Event', 'Currency', 'AP or CF']
+
+        for col in df.columns:
+            # Skip non-data columns
+            if col in non_numeric_cols_to_skip:
+                continue
+
+            # Attempt to convert column to numeric type
+            try:
+                # errors='coerce' will change values that cannot be converted to NaT/NaN
+                temp_series = pd.to_numeric(df[col], errors='coerce')
+                # If the number of non-null values after conversion exceeds 50% of the total, it is considered a numeric column
+                if temp_series.notna().sum() / len(temp_series) > 0.5:
+                    numeric_columns.append(col)
+            except:
+                continue
+
+        self.logger.info(f"Identified numeric columns: {numeric_columns}")
+        return numeric_columns
+
+    def process_weekly_cost_aggregation(self, df):
+        """
+        Processes weekly aggregation
+
+        Args:
+            df: Original DataFrame
+
+        Returns:
+            tuple: (Original aggregated data, VCX aggregated data)
+        """
+        try:
+            # 1. Ensure Event Date column exists and is in date format
+            if 'Event Date' not in df.columns:
+                raise ValueError("Missing 'Event Date' column in data")
+
+            df['Event Date'] = pd.to_datetime(df['Event Date'], errors='coerce')
+
+            # 2. Add StartOfWeek column
+            df['StartOfWeek'] = df['Event Date'].apply(self.get_start_of_week)
+
+            self.logger.info("StartOfWeek column added")
+
+            # 3. Check for existence of required columns
+            # Now also include 'Guide&Coord' (updated name)
+            required_columns_for_pivot = ['StartOfWeek', 'Event ID', 'Event', 'Currency', 'AP or CF',
+                                          'COGS exc Guide&Coord', 'Guide&Coord']  # Updated column name
+            missing_columns = [col for col in required_columns_for_pivot if col not in df.columns]
+
+            if missing_columns:
+                raise ValueError(f"Missing the following columns in data, unable to generate Pivot Table: {missing_columns}")
+
+            # 4. Drop rows where StartOfWeek is empty
+            df_clean = df.dropna(subset=['StartOfWeek']).copy()
+
+            # 5. Ensure COGS exc Guide&Coord and Guide&Coord are numeric types
+            df_clean['COGS exc Guide&Coord'] = pd.to_numeric(df_clean['COGS exc Guide&Coord'], errors='coerce')
+            df_clean['Guide&Coord'] = pd.to_numeric(df_clean['Guide&Coord'], errors='coerce')  # Updated column name and ensure numeric
+
+            # 6. Original aggregation (keeping original functionality, for Pivot Table)
+            groupby_columns_for_pivot = ['StartOfWeek', 'Event ID', 'Event', 'Currency', 'AP or CF']
+
+            aggregated_df = df_clean.groupby(groupby_columns_for_pivot).agg({
+                'COGS exc Guide&Coord': 'sum',
+                'Guide&Coord': 'sum'  # Also aggregate Guide&Coord (updated name)
+            }).reset_index()
+
+            self.logger.info(f"Original aggregation completed, total {len(aggregated_df)} rows")
+
+            # 7. New: Identify all numeric columns and perform VCX aggregation
+            numeric_columns = self.identify_numeric_columns(df_clean)
+
+            if numeric_columns:
+                # Ensure all numeric columns are of numeric type
+                for col in numeric_columns:
+                    df_clean[col] = pd.to_numeric(df_clean[col], errors='coerce').fillna(0)
+
+                # Create aggregation dictionary
+                agg_dict = {col: 'sum' for col in numeric_columns}
+
+                # --- Main modification point ---
+                # When aggregating VCX data, do not use 'AP or CF' column
+                vcx_groupby_columns = ['StartOfWeek', 'Event ID', 'Event', 'Currency']
+                vcx_aggregated = df_clean.groupby(vcx_groupby_columns).agg(agg_dict).reset_index()
+
+                # Add VCX prefix to numeric column names
+                column_mapping = {col: f'VCX_{col}' for col in numeric_columns}
+                vcx_aggregated = vcx_aggregated.rename(columns=column_mapping)
+
+                self.logger.info(f"VCX aggregation completed, total {len(vcx_aggregated)} rows, aggregated {len(numeric_columns)} numeric columns")
+
+            else:
+                self.logger.warning("No aggregatable numeric columns identified")
+                vcx_aggregated = None
+
+            return aggregated_df, vcx_aggregated
+
+        except Exception as e:
+            self.logger.error(f"Error processing weekly aggregation: {str(e)}")
+            raise
+
+    def create_pivot_table(self, df):
+        """
+        Creates a pivot table, handling Guide&Coord merging and column renaming.
+
+        Args:
+            df: Aggregated data
+
+        Returns:
+            DataFrame: Pivot table
+        """
+        try:
+            # Create pivot table for 'COGS exc Guide&Coord'
+            pivot_cogs = df.pivot_table(
+                index=['StartOfWeek', 'Event ID', 'Event', 'Currency'],
+                columns='AP or CF',
+                values='COGS exc Guide&Coord',
+                aggfunc='sum',
+                fill_value=0
+            ).reset_index()
+
+            # Rename columns for COGS exc Guide&Coord, assuming 'AP' and 'CF' are output directly
+            # These are the columns for COGS exc Guide&Coord AP and COGS exc Guide&Coord CF
+            pivot_cogs.rename(columns={'AP': 'AP', 'CF': 'CF'}, inplace=True)
+
+            # Add new column 'COGS exc Guide&Coord' by summing 'AP' and 'CF'
+            if 'AP' in pivot_cogs.columns and 'CF' in pivot_cogs.columns:
+                pivot_cogs['COGS exc Guide&Coord'] = pivot_cogs['AP'] + pivot_cogs['CF']
+                # Fill any NaN in the new sum column with 0
+                pivot_cogs['COGS exc Guide&Coord'].fillna(0, inplace=True)
+            else:
+                self.logger.warning("Columns 'AP' or 'CF' for 'COGS exc Guide&Coord' not found. 'COGS exc Guide&Coord' sum column not created.")
+                if 'COGS exc Guide&Coord' not in pivot_cogs.columns:
+                    pivot_cogs['COGS exc Guide&Coord'] = 0  # Ensure column exists even if sum not possible
+
+            # Create pivot table for 'Guide&Coord' (updated name)
+            pivot_guide_coord = df.pivot_table(
+                index=['StartOfWeek', 'Event ID', 'Event', 'Currency'],
+                columns='AP or CF',
+                values='Guide&Coord',  # Updated column name
+                aggfunc='sum',
+                fill_value=0
+            ).reset_index()
+
+            # Merge 'Guide&Coord AP' and 'Guide&Coord CF' into a single 'Guide&Coord' column
+            if 'AP' in pivot_guide_coord.columns and 'CF' in pivot_guide_coord.columns:
+                pivot_guide_coord['Guide&Coord'] = pivot_guide_coord['AP'] + pivot_guide_coord['CF']  # Updated column name
+                # Drop the original AP and CF columns for Guide&Coord after merging
+                pivot_guide_coord.drop(columns=['AP', 'CF'], inplace=True)
+            else:
+                self.logger.warning("Columns 'AP' or 'CF' for 'Guide&Coord' not found. 'Guide&Coord' sum column not created from AP/CF.")
+                if 'Guide&Coord' not in pivot_guide_coord.columns:  # Ensure column exists if it wasn't created by sum
+                    pivot_guide_coord['Guide&Coord'] = 0  # Default to 0 if not present after aggregation
+
+            # Merge the two pivot tables
+            # Select relevant columns from pivot_guide_coord to merge (only the combined 'Guide&Coord')
+            final_pivot_df = pd.merge(
+                pivot_cogs,
+                pivot_guide_coord[['StartOfWeek', 'Event ID', 'Event', 'Currency', 'Guide&Coord']],  # Only merged Guide&Coord
+                on=['StartOfWeek', 'Event ID', 'Event', 'Currency'],
+                how='left'
+            )
+
+            # Fill any NaN values that resulted from the merge for 'Guide&Coord' with 0
+            if 'Guide&Coord' in final_pivot_df.columns:
+                final_pivot_df['Guide&Coord'].fillna(0, inplace=True)
+
+            # Reset column names index
+            final_pivot_df.columns.name = None
+
+            self.logger.info(f"Pivot table created, shape: {final_pivot_df.shape}")
+            self.logger.info(f"Pivot table column names: {list(final_pivot_df.columns)}")
+
+            return final_pivot_df
+
+        except Exception as e:
+            self.logger.error(f"Error creating pivot table: {str(e)}")
+            raise
+
+    def save_cost_results(self, pivot_df, vcx_df=None, filename='weekly_cost_export_result.xlsx'):
+        """
+        Saves results to file
+
+        Args:
+            pivot_df: Pivot table result
+            vcx_df: VCX aggregation result
+            filename: File name
+        """
+        try:
+            output_path = os.path.join(self.OUTPUT_DIR, filename)
+
+            # Use ExcelWriter to save multiple sheets
+            with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
+                # Save final pivot table result
+                pivot_df.to_excel(writer, sheet_name='Pivot_Result', index=False)
+                self.logger.info("Pivot table result saved to 'Pivot_Result' sheet")
+
+                # Save VCX aggregation result (if it exists)
+                if vcx_df is not None:
+                    vcx_df.to_excel(writer, sheet_name='VCX_Aggregation', index=False)
+                    self.logger.info("VCX aggregation result saved to 'VCX_Aggregation' sheet")
+
+            self.logger.info(f"Results saved to: {output_path}")
+
+        except Exception as e:
+            self.logger.error(f"Error saving file: {str(e)}")
+            raise
+
+    def process_weekly_cost_export(self, read_from_excel: bool = True):
+        """
+        Executes the complete weekly cost export process, and provides the option to re-read from Excel.
+
+        Args:
+            read_from_excel (bool): If True, read from Excel and save as CSV;
+                                    If False, read directly from CSV.
+
+        Returns:
+            tuple: (Pivot table result, VCX aggregation result)
+        """
+        try:
+            self.logger.info("Starting Weekly Cost Export process...")
+
+            # 1. Read data (based on read_from_excel parameter)
+            raw_data = self.load_cost_export_data(read_from_excel=read_from_excel)
+
+            # 2. Process weekly aggregation (including VCX aggregation)
+            aggregated_data, vcx_data = self.process_weekly_cost_aggregation(raw_data)
+
+            # 3. Create pivot table (maintaining original functionality)
+            pivot_result = self.create_pivot_table(aggregated_data)
+
+            # 4. Save results (including VCX data)
+            self.save_cost_results(pivot_result, vcx_data)
+
+            self.logger.info("Weekly Cost Export process completed!")
+
+            return pivot_result, vcx_data
+
+        except Exception as e:
+            self.logger.error(f"Error executing process: {str(e)}")
+            raise
+
+    # Methods from RevenueAnalyzeBaseData
+    def load_weekly_cost_export(self):
+        """
+        Reads Weekly cost export data.
+
+        Returns:
+            DataFrame: Weekly cost export data.
+        """
+        try:
+            file_path = os.path.join(self.OUTPUT_DIR, 'weekly_cost_export_result.xlsx')
+
+            self.logger.info(f"正在读取Weekly cost export文件: {file_path}")
+
+            if not os.path.exists(file_path):
+                raise FileNotFoundError(f"文件不存在: {file_path}")
+
+            df = pd.read_excel(file_path)
+
+            self.logger.info(f"成功读取Weekly cost export数据，共{len(df)}行，{len(df.columns)}列")
+            self.logger.info(f"列名: {list(df.columns)}")
+
+            return df
+
+        except Exception as e:
+            self.logger.error(f"读取Weekly cost export文件时出错: {str(e)}")
+            raise
+
+    def load_weekly_revenue_data(self):
+        """
+        Reads Weekly revenue data.
+
+        Returns:
+            DataFrame: Weekly revenue data.
+        """
+        try:
+            file_path = os.path.join(self.OUTPUT_DIR, 'Weekly_Revenue_Data.xlsx')
+
+            self.logger.info(f"正在读取Weekly revenue data文件: {file_path}")
+
+            if not os.path.exists(file_path):
+                raise FileNotFoundError(f"文件不存在: {file_path}")
+
+            # Read the 'Weekly_Summary' worksheet
+            df = pd.read_excel(file_path, sheet_name='Weekly_Summary')
+
+            self.logger.info(f"成功读取Weekly revenue data数据，共{len(df)}行，{len(df.columns)}列")
+            self.logger.info(f"列名: {list(df.columns)}")
+
+            return df
+
+        except Exception as e:
+            self.logger.error(f"读取Weekly revenue data文件时出错: {str(e)}")
+            raise
+
+    def validate_merge_columns(self, df_revenue, df_cost_export):
+        """
+        Validates the existence of columns required for merging.
+
+        Args:
+            df_revenue: Weekly revenue data.
+            df_cost_export: Weekly cost export data.
+        """
+        # Check required columns for Weekly revenue data
+        revenue_required = ['StartOfWeek', 'Tour ID', 'Currency']
+        revenue_missing = [col for col in revenue_required if col not in df_revenue.columns]
+
+        if revenue_missing:
+            self.logger.error(f"Weekly revenue data缺少列: {revenue_missing}")
+            self.logger.info(f"Weekly revenue data实际列名: {list(df_revenue.columns)}")
+            raise ValueError(f"Weekly revenue data缺少必要列: {revenue_missing}")
+
+        # Check required columns for Weekly cost export
+        cost_export_required = ['StartOfWeek', 'Event ID', 'Currency']
+        cost_export_missing = [col for col in cost_export_required if col not in df_cost_export.columns]
+
+        if cost_export_missing:
+            self.logger.error(f"Weekly cost export缺少列: {cost_export_missing}")
+            self.logger.info(f"Weekly cost export实际列名: {list(df_cost_export.columns)}")
+            raise ValueError(f"Weekly cost export缺少必要列: {cost_export_missing}")
+
+        self.logger.info("合并列验证通过")
+
+    def prepare_data_for_merge(self, df_revenue, df_cost_export):
+        """
+        Prepares data for merging.
+
+        Args:
+            df_revenue: Weekly revenue data.
+            df_cost_export: Weekly cost export data.
+
+        Returns:
+            tuple: Processed DataFrames.
+        """
+        # Ensure StartOfWeek column is in date format
+        df_revenue['StartOfWeek'] = pd.to_datetime(df_revenue['StartOfWeek'])
+        df_cost_export['StartOfWeek'] = pd.to_datetime(df_cost_export['StartOfWeek'])
+
+        # Ensure ID columns are in string format for matching
+        df_revenue['Tour ID'] = df_revenue['Tour ID'].astype(str)
+        df_cost_export['Event ID'] = df_cost_export['Event ID'].astype(str)
+
+        # Ensure Currency column is in string format
+        df_revenue['Currency'] = df_revenue['Currency'].astype(str)
+        df_cost_export['Currency'] = df_cost_export['Currency'].astype(str)
+
+        self.logger.info("数据类型转换完成")
+
+        return df_revenue, df_cost_export
+
+    def merge_data(self, df_revenue, df_cost_export):
+        """
+        Merges Weekly revenue data and Weekly cost export data.
+
+        Args:
+            df_revenue: Weekly revenue data.
+            df_cost_export: Weekly cost export data.
+
+        Returns:
+            DataFrame: Merged data.
+        """
+        try:
+            # Validate merge columns
+            self.validate_merge_columns(df_revenue, df_cost_export)
+
+            # Prepare data
+            df_revenue, df_cost_export = self.prepare_data_for_merge(df_revenue, df_cost_export)
+
+            # Perform left join
+            self.logger.info("开始执行左连接...")
+
+            merged_df = pd.merge(
+                df_revenue,
+                df_cost_export,
+                left_on=['StartOfWeek', 'Tour ID', 'Currency'],
+                right_on=['StartOfWeek', 'Event ID', 'Currency'],
+                how='left',
+                suffixes=('_revenue', '_cost_export')
+            )
+
+            self.logger.info(f"合并完成，结果共{len(merged_df)}行")
+
+            # Display merge statistics
+            total_revenue_records = len(df_revenue)
+            matched_records = merged_df['Event ID'].notna().sum()
+            unmatched_records = total_revenue_records - matched_records
+
+            self.logger.info(f"合并统计:")
+            self.logger.info(f"  - 总的revenue记录: {total_revenue_records}")
+            self.logger.info(f"  - 成功匹配记录: {matched_records}")
+            self.logger.info(f"  - 未匹配记录: {unmatched_records}")
+            self.logger.info(f"  - 匹配率: {(matched_records / total_revenue_records) * 100:.1f}%")
+
+            return merged_df
+
+        except Exception as e:
+            self.logger.error(f"合并数据时出错: {str(e)}")
+            raise
+
+    def aggregate_data_by_currency_and_week(self, df):
+        """
+        Aggregates merged data by Currency and StartOfWeek.
+        All numerical columns except 'group_size' are summed.
+        Text data columns are automatically ignored.
+
+        Args:
+            df (pd.DataFrame): Merged data.
+
+        Returns:
+            pd.DataFrame: Aggregated data.
+        """
+        try:
+            self.logger.info("开始按照 'Currency' 和 'StartOfWeek' 聚合数据...")
+
+            # Ensure 'Currency' and 'StartOfWeek' exist
+            if 'Currency' not in df.columns or 'StartOfWeek' not in df.columns:
+                raise ValueError("DataFrame中缺少 'Currency' 或 'StartOfWeek' 列，无法进行聚合。")
+
+            # Identify all numerical columns
+            numerical_cols = df.select_dtypes(include=np.number).columns.tolist()
+
+            # Create aggregation function dictionary, all numerical columns default to sum aggregation
+            agg_funcs = {col: 'sum' for col in numerical_cols}
+
+            # As per requirement, 'group_size' column is not summed
+            if 'group_size' in agg_funcs:
+                self.logger.info("排除 'group_size' 列的sum聚合。")
+                del agg_funcs['group_size']
+
+            # Filter out columns not present in the current DataFrame
+            cols_to_aggregate = {col: func for col, func in agg_funcs.items() if col in df.columns}
+
+            # Perform aggregation
+            # reset_index() converts 'Currency' and 'StartOfWeek' from index to columns
+            aggregated_df = df.groupby(['Currency', 'StartOfWeek']).agg(cols_to_aggregate).reset_index()
+
+            self.logger.info(f"数据聚合完成，结果共{len(aggregated_df)}行。")
+            return aggregated_df
+
+        except Exception as e:
+            self.logger.error(f"聚合数据时出错: {str(e)}")
+            raise
+
+    def save_base_data(self, merged_df, aggregated_df, filename='revenue_analyze_base_data.xlsx'):
+        """
+        Saves merged base data and aggregated data to different worksheets in the same Excel file.
+
+        Args:
+            merged_df: Original merged DataFrame.
+            aggregated_df: Aggregated DataFrame.
+            filename: File name.
+        """
+        try:
+            output_path = os.path.join(self.OUTPUT_DIR, filename)
+
+            # Use 'openpyxl' engine as requested
+            with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
+                # Save original merged data to 'Merged_Data' worksheet
+                merged_df.to_excel(writer, sheet_name='Merged_Data', index=False)
+                self.logger.info(f"原始合并数据已保存到 '{output_path}' 的 'Merged_Data' 工作表。")
+
+                # Save aggregated data to 'Aggregated_Data' worksheet
+                aggregated_df.to_excel(writer, sheet_name='Aggregated_Data', index=False)
+                self.logger.info(f"聚合数据已保存到 '{output_path}' 的 'Aggregated_Data' 工作表。")
+
+        except Exception as e:
+            self.logger.error(f"保存文件时出错: {str(e)}")
+            raise
+
+    def create_summary_report(self, df):
+        """
+        Creates a data summary report.
+
+        Args:
+            df: Merged data.
+        """
+        try:
+            self.logger.info("=== 数据摘要报告 ===")
+            self.logger.info(f"总行数: {len(df)}")
+            self.logger.info(f"总列数: {len(df.columns)}")
+
+            # Statistics by week
+            if 'StartOfWeek' in df.columns:
+                week_summary = df.groupby('StartOfWeek').size()
+                self.logger.info(f"覆盖周数: {len(week_summary)}")
+                self.logger.info(f"日期范围: {df['StartOfWeek'].min()} 到 {df['StartOfWeek'].max()}")
+
+            # Statistics by currency
+            if 'Currency' in df.columns:
+                currency_summary = df['Currency'].value_counts()
+                self.logger.info(f"货币类型: {list(currency_summary.index)}")
+
+            # Check for null values
+            null_summary = df.isnull().sum()
+            null_columns = null_summary[null_summary > 0]
+            if len(null_columns) > 0:
+                self.logger.info("包含空值的列:")
+                for col, count in null_columns.items():
+                    self.logger.info(f"  - {col}: {count} ({count / len(df) * 100:.1f}%)")
+            else:
+                self.logger.info("没有包含空值的列。")
+
+        except Exception as e:
+            self.logger.error(f"生成摘要报告时出错: {str(e)}")
+
+    def prepare_revenue_analyze_base_data(self):
+        """
+        Executes the complete base data preparation process.
+
+        Returns:
+            DataFrame: The final aggregated data.
+        """
+        try:
+            self.logger.info("开始执行Revenue Analyze基础数据准备流程...")
+
+            # 1. Read Weekly cost export data
+            cost_export_data = self.load_weekly_cost_export()
+
+            # 2. Read Weekly revenue data
+            revenue_data = self.load_weekly_revenue_data()
+
+            # 3. Merge data
+            merged_data = self.merge_data(revenue_data, cost_export_data)
+
+            # 4. New aggregation program: aggregate merged data by Currency and WeekOfStart
+            #    Note: Here, 'WeekOfStart' is assumed to be 'StartOfWeek' to maintain consistency with existing code.
+            aggregated_data = self.aggregate_data_by_currency_and_week(merged_data)
+
+            # 5. Generate summary report (using aggregated data)
+            self.create_summary_report(aggregated_data)
+
+            # 6. Save results (save original merged data and aggregated data to different worksheets)
+            self.save_base_data(merged_data, aggregated_data)
+
+            self.logger.info("Revenue Analyze基础数据准备流程执行完成!")
+
+            return aggregated_data  # Return aggregated data
+
+        except Exception as e:
+            self.logger.error(f"执行基础数据准备流程时出错: {str(e)}")
+            raise
+
+    # Methods from EnhancedCostRevenueAnalyzer
+    def load_analysis_data(self, input_filename='revenue_analyze_base_data.xlsx', input_sheetname='Aggregated_Data'):
+        """
+        载入 Excel 数据并进行基础清洗。
+        """
+        file_path = os.path.join(self.OUTPUT_DIR, input_filename)
+        try:
+            self.logger.info(f"Attempting to read file: {file_path}")
+            self.df = pd.read_excel(file_path, sheet_name=input_sheetname)
+            self.logger.info("File read successfully!")
+
+            required_cols = [self.revenue_column, self.currency_column] + self.cost_columns
+            missing_cols = [col for col in required_cols if col not in self.df.columns]
+
+            if missing_cols:
+                self.logger.error(f"Error: Missing the following required columns in the input file: {missing_cols}")
+                self.df = None
+                return
+
+            if 'StartOfWeek' in self.df.columns:
+                self.df['StartOfWeek'] = pd.to_datetime(self.df['StartOfWeek'])
+                self.df.sort_values(by='StartOfWeek', inplace=True)
+
+            self.logger.info(f"Data loaded, total {len(self.df)} rows.")
+
+        except FileNotFoundError:
+            self.logger.error(f"Error: File not found, please check the path: {file_path}")
+            self.df = None
+        except Exception as e:
+            self.logger.error(f"An error occurred while reading the file: {e}")
+            self.df = None
+
+    def format_equation_and_stats(self, model, cost_col, revenue_col, has_intercept):
+        """
+        为带截距和不带截距模型格式化回归方程和统计信息。
+        """
+        slope = model.params[revenue_col]
+        r_squared = model.rsquared
+        # 截距项的 P 值可能不存在，需要安全获取
+        p_value_slope = model.pvalues[revenue_col]
+
+        if has_intercept:
+            constant = model.params['const']
+            equation = f"{cost_col} = {constant:.4f} + {slope:.4f} × {revenue_col}"
+            p_value_constant = model.pvalues['const']
+            p_str_constant = f"p_const < 0.001" if p_value_constant < 0.001 else f"p_const = {p_value_constant:.3f}"
+        else:
+            equation = f"{cost_col} = {slope:.4f} × {revenue_col} (No Intercept)"
+            p_str_constant = ""  # 无截距模型没有常数项的 P 值
+
+        p_str_slope = f"p_slope < 0.001" if p_value_slope < 0.001 else f"p_slope = {p_value_slope:.3f}"
+        stats_str = f"R² = {r_squared:.3f}, Slope {p_str_slope}"
+        if has_intercept:
+            stats_str += f", Intercept {p_str_constant}"
+
+        return equation, stats_str
+
+    def perform_conditional_analysis(self, output_excel_filename='conditional_model_results.xlsx'):
+        """
+        根据截距值执行条件线性回归分析。
+        如果截距为负，则使用无截距模型。否则，使用带截距模型。
+        """
+        if self.df is None:
+            self.logger.error("Data not loaded successfully, cannot proceed with analysis.")
+            return
+
+        self.logger.info("\n===== Starting Conditional Linear Regression Analysis =====")
+
+        currencies = self.df[self.currency_column].unique()
+        for currency in currencies:
+            currency_name = 'Unknown' if pd.isna(currency) else str(currency)
+
+            # 创建货币专用文件夹
+            currency_folder = os.path.join(self.OUTPUT_DIR, currency_name)
+            os.makedirs(currency_folder, exist_ok=True)
+
+            currency_data_mask = self.df[self.currency_column].isna() if currency_name == 'Unknown' else (
+                        self.df[self.currency_column] == currency)
+            currency_data = self.df[currency_data_mask]
+
+            self.logger.info(f"\n--- Analyzing Currency: {currency_name} ---")
+            if len(currency_data) < 10:
+                self.logger.warning(f"Warning: Insufficient data for currency {currency_name} (less than 10 rows), skipping.")
+                continue
+
+            currency_excel_path = os.path.join(currency_folder, f"{currency_name}_{output_excel_filename}")
+
+            with pd.ExcelWriter(currency_excel_path, engine='openpyxl') as writer:
+                for cost_col in self.cost_columns:
+                    self.logger.info(f"  Analyzing {cost_col}...")
+
+                    data_for_model = currency_data[[self.revenue_column, cost_col]].dropna()
+                    if len(data_for_model) < 5:
+                        self.logger.info(f"  Skipping {cost_col} due to insufficient data points (less than 5).")
+                        continue
+
+                    y = data_for_model[cost_col]
+                    # 为带截距模型准备自变量
+                    X_with_const = sm.add_constant(data_for_model[[self.revenue_column]])
+                    # 为无截距模型准备自变量
+                    X_no_const = data_for_model[[self.revenue_column]]
+
+                    try:
+                        # 首先，尝试使用带截距的模型
+                        model_with_intercept = sm.OLS(y, X_with_const).fit()
+                        constant_value = model_with_intercept.params['const']
+
+                        model_to_use = None
+                        constant_to_store = None
+                        slope_to_store = None
+                        p_value_slope_to_store = None
+                        r_squared_to_store = None
+                        has_intercept = False
+                        p_value_constant_to_store = None  # 初始化常数项的P值
+
+                        if constant_value < 0:
+                            # 如果截距为负，则使用无截距模型
+                            self.logger.info(f"    Intercept for {cost_col} is negative ({constant_value:.4f}), switching to no-intercept model.")
+                            model_to_use = sm.OLS(y, X_no_const).fit()
+                            constant_to_store = 0  # 根据要求，无截距模型常数项记为0
+                            has_intercept = False
+                            p_value_constant_to_store = None  # 无截距模型没有常数项的P值
+                        else:
+                            # 如果截距为非负，则保留带截距模型
+                            self.logger.info(f"    Intercept for {cost_col} is non-negative ({constant_value:.4f}), retaining intercept model.")
+                            model_to_use = model_with_intercept
+                            constant_to_store = constant_value
+                            has_intercept = True
+                            p_value_constant_to_store = model_to_use.pvalues['const']
+
+                        slope_to_store = model_to_use.params[self.revenue_column]
+                        p_value_slope_to_store = model_to_use.pvalues[self.revenue_column]
+                        r_squared_to_store = model_to_use.rsquared
+
+                        # 存储参数用于后续汇总
+                        if currency_name not in self.model_parameters:
+                            self.model_parameters[currency_name] = {}
+                        self.model_parameters[currency_name][cost_col] = {
+                            'slope': slope_to_store,
+                            'constant': constant_to_store,
+                            'p_value_slope': p_value_slope_to_store,
+                            'r_squared': r_squared_to_store,
+                            'has_intercept': has_intercept,
+                            'p_value_constant': p_value_constant_to_store
+                        }
+
+                        # --- 结果保存和绘图 ---
+                        sheet_name = cost_col.replace(" ", "_").replace("&", "And")[:31]
+                        summary_df_table0 = pd.DataFrame(model_to_use.summary2().tables[0])
+                        summary_df_table0.to_excel(writer, sheet_name=sheet_name, index=False, header=False)
+                        pd.DataFrame(model_to_use.summary2().tables[1]).to_excel(writer, sheet_name=sheet_name,
+                                                                                 startrow=len(summary_df_table0) + 2)
+
+                        plt.figure(figsize=(12, 8))
+                        plt.scatter(data_for_model[self.revenue_column], y, alpha=0.6, label='Data points')
+
+                        x_line = np.linspace(data_for_model[self.revenue_column].min(),
+                                             data_for_model[self.revenue_column].max(), 100)
+                        if has_intercept:
+                            y_line = model_to_use.predict(sm.add_constant(pd.DataFrame({self.revenue_column: x_line})))
+                            plt.plot(x_line, y_line, color='red', linewidth=2, label='Regression line (with intercept)')
+                            plt.title(f'{currency_name}: {cost_col} vs {self.revenue_column} (With Intercept)', fontsize=14)
+                        else:
+                            y_line = model_to_use.predict(pd.DataFrame({self.revenue_column: x_line}))
+                            plt.plot(x_line, y_line, color='red', linewidth=2, label='Regression line (no intercept)')
+                            plt.title(f'{currency_name}: {cost_col} vs {self.revenue_column} (No Intercept)', fontsize=14)
+
+                        plt.xlabel(self.revenue_column)
+                        plt.ylabel(cost_col)
+
+                        equation, stats_str = self.format_equation_and_stats(model_to_use, cost_col, self.revenue_column, has_intercept)
+                        textstr = f'{equation}\n{stats_str}'
+                        props = dict(boxstyle='round', facecolor='wheat', alpha=0.8)
+                        plt.text(0.05, 0.95, textstr, transform=plt.gca().transAxes, fontsize=10,
+                                 verticalalignment='top', bbox=props)
+
+                        plt.grid(True, alpha=0.3)
+                        plt.legend()
+                        plt.tight_layout()
+
+                        plot_filename = f'{sheet_name}_vs_{self.revenue_column.replace(" ", "_")}_scatter.png'
+                        plot_path = os.path.join(currency_folder, plot_filename)
+                        plt.savefig(plot_path, dpi=300)
+                        plt.close()
+
+                    except Exception as e:
+                        self.logger.error(f"  An error occurred while analyzing {cost_col}: {e}")
+
+            self.logger.info(f"Model results for currency {currency_name} saved to: {currency_excel_path}")
+
+    def summarize_model_parameters(self, output_filename='model_parameters_summary.xlsx'):
+        """
+        汇总模型的关键参数。
+
+        Args:
+            output_filename (str): 输出的汇总Excel文件名。
+        """
+        if not self.model_parameters:
+            self.logger.info("\nNo model parameters to summarize.")
+            return
+
+        self.logger.info("\nStarting to summarize model parameters...")
+        # 更新了要汇总的成本列，将 'AP COGS' 替换为 'COGS exc Guide&Coord'
+        target_costs = ['CF', 'AP', 'Guide&Coord', 'COGS exc Guide&Coord']
+        summary_data = []
+
+        for currency, cost_models in self.model_parameters.items():
+            row_data = {'Currency': currency}
+            for cost in target_costs:
+                if cost in cost_models:
+                    params = cost_models[cost]
+                    row_data[f'{cost}_slope'] = params['slope']
+                    row_data[f'{cost}_constant'] = params['constant']
+                    row_data[f'{cost}_r_squared'] = params['r_squared']
+                    row_data[f'{cost}_p_value_slope'] = params['p_value_slope']
+                    row_data[f'{cost}_p_value_constant'] = params['p_value_constant']
+                    row_data[f'{cost}_has_intercept'] = 'Yes' if params['has_intercept'] else 'No'
+                else:
+                    row_data[f'{cost}_slope'] = None
+                    row_data[f'{cost}_constant'] = None
+                    row_data[f'{cost}_r_squared'] = None
+                    row_data[f'{cost}_p_value_slope'] = None
+                    row_data[f'{cost}_p_value_constant'] = None
+                    row_data[f'{cost}_has_intercept'] = None
+            summary_data.append(row_data)
+
+        if not summary_data:
+            self.logger.info("No data to summarize.")
+            return
+
+        summary_df = pd.DataFrame(summary_data)
+        output_path = os.path.join(self.OUTPUT_DIR, output_filename)
+        summary_df.to_excel(output_path, index=False)
+
+        self.logger.info(f"Model parameter summary saved to: {output_path}")
+        self.logger.info("\nParameter summary preview:")
+        self.logger.info(summary_df.to_string(index=False, float_format='%.6f'))
+
+    def perform_enhanced_analysis(self):
+        """
+        Performs the enhanced cost-revenue analysis after loading data.
+        """
+        self.load_analysis_data()
+
+        if self.df is not None:
+            # 执行条件分析
+            self.perform_conditional_analysis()
+
+            # 汇总参数
+            self.summarize_model_parameters()
+        else:
+            self.logger.error("Data loading failed, please check file path and content.")
+
+    # Unified run method to execute all steps in order
+    def run_all(self, read_from_excel: bool = True):
+        """
+        Executes all steps in order: process revenue, process cost, prepare base data, perform analysis.
+        
+        Args:
+            read_from_excel (bool): Whether to read from Excel for revenue and cost processing.
+        """
+        # 1. Process weekly revenue data
+        self.process_weekly_revenue_data(read_from_excel=read_from_excel)
+        
+        # 2. Process weekly cost export
+        self.process_weekly_cost_export(read_from_excel=read_from_excel)
+        
+        # 3. Prepare revenue analyze base data
+        self.prepare_revenue_analyze_base_data()
+        
+        # 4. Perform enhanced analysis
+        self.perform_enhanced_analysis()
