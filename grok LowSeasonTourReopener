@@ -1,0 +1,157 @@
+import os
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import re
+import logging
+
+class LowSeasonTourReopener:
+    def __init__(self, time_agg_level, reference_year):
+        self.time_agg_level = time_agg_level.lower()  # 'weekly' or 'daily'
+        self.reference_year = reference_year
+        self.base_dir = os.path.dirname(os.path.abspath(__file__))
+        self.input_dir = os.path.join(self.base_dir, 'Spreadsheets Source')
+        self.output_dir = os.path.join(self.base_dir, 'Outputs')
+        self.public_dir = r"C:\City Experience\Public Data Base"
+        self.folder_name = self.time_agg_level.capitalize()
+        self.level_dir = os.path.join(self.output_dir, self.folder_name)
+        self.date_col = 'Date'
+        self.match_col = 'day_of_year' if self.time_agg_level == 'daily' else 'week_of_year'
+        self.predict_tour_ids = None
+        self.tour_id_map = None
+
+    def process(self):
+        # Step 1: Read Tours Open in Low Season and fill Overall Growth Rate
+        tours_open_path = os.path.join(self.input_dir, 'Tours Open in Low Season.xlsx')
+        tours_open = pd.read_excel(tours_open_path)
+        tours_open['Open Start Date'] = pd.to_datetime(tours_open['Open Start Date'])
+        tours_open['Open End Date'] = pd.to_datetime(tours_open['Open End Date'])
+
+        actuals_path = os.path.join(self.level_dir, f'actuals_{self.time_agg_level}_horizontal.csv')
+        actuals = pd.read_csv(actuals_path)
+        actuals['Tour ID'] = actuals['Tour ID'].astype(str).str.replace(r'\.0$', '', regex=True)
+        overall_growth_rate = actuals.loc[actuals['Tour ID'] == 'total', 'Sigmoid_Growth_Rate'].item()
+        tours_open['Overall Growth Rate'] = overall_growth_rate
+        tours_open.to_excel(tours_open_path, index=False)
+
+        # Set for plotting
+        self.predict_tour_ids = tours_open['Tour ID'].unique().tolist()
+        self.tour_id_map = dict(zip(tours_open['Tour ID'], tours_open['Event Name']))
+
+        # Step 2: Read summary_stacked and filter Tours low season data before process
+        summary_path = os.path.join(self.level_dir, f'summary_stacked_{self.time_agg_level}.csv')
+        summary = pd.read_csv(summary_path)
+        summary['Date'] = pd.to_datetime(summary['Date'])
+        summary['Tour ID'] = summary['Tour ID'].astype(str).str.replace(r'\.0$', '', regex=True)
+
+        tours_low_before = pd.DataFrame()
+        for _, row in tours_open.iterrows():
+            tour_id = str(row['Tour ID'])
+            start = row['Open Start Date']
+            end = row['Open End Date']
+            mask = (summary['Tour ID'] == tour_id) & (summary['Date'] >= start) & (summary['Date'] <= end)
+            tours_low_before = pd.concat([tours_low_before, summary[mask]])
+
+        # Step 3: Read historical data and process Pax historical data after process
+        grouped_path = os.path.join(self.level_dir, f'grouped_data_{self.time_agg_level}_True.csv')
+        historical = pd.read_csv(grouped_path)
+        orig_date_col = 'WeekStart' if self.time_agg_level == 'weekly' else 'Date'
+        historical = historical.rename(columns={orig_date_col: 'Date'})
+        historical['Date'] = pd.to_datetime(historical['Date'])
+        historical['Tour ID'] = historical['Tour ID'].astype(str).str.replace(r'\.0$', '', regex=True)
+        historical = historical[historical['Date'].dt.year == self.reference_year]
+
+        historical = historical.merge(tours_open[['Tour ID', 'Open Start Date', 'Open End Date', 'Expected Additional Growth Rate', 'Overall Growth Rate']], on='Tour ID', how='inner')
+
+        historical['start_ref'] = historical['Open Start Date'].apply(lambda x: x.replace(year=self.reference_year))
+        historical['end_ref'] = historical['Open End Date'].apply(lambda x: x.replace(year=self.reference_year))
+        historical = historical[(historical['Date'] >= historical['start_ref']) & (historical['Date'] <= historical['end_ref'])]
+
+        if self.match_col == 'day_of_year':
+            historical[self.match_col] = historical['Date'].dt.dayofyear
+        else:
+            historical[self.match_col] = historical['Date'].dt.isocalendar().week
+
+        historical['Growth_Adj_Pred'] = historical['Pax'] * (1 + historical['Overall Growth Rate']) * (1 + historical['Expected Additional Growth Rate'])
+
+        pax_historical_after = historical[['Tour ID', self.match_col, 'Growth_Adj_Pred']]
+
+        # Step 4: Process Tours low season data after process
+        if self.match_col == 'day_of_year':
+            tours_low_before[self.match_col] = tours_low_before['Date'].dt.dayofyear
+        else:
+            tours_low_before[self.match_col] = tours_low_before['Date'].dt.isocalendar().week
+
+        cols = [col for col in tours_low_before.columns if col != 'Growth_Adj_Pred' and col != self.match_col]
+        tours_low_temp = tours_low_before[cols + [self.match_col]]
+        tours_low_after = tours_low_temp.merge(pax_historical_after, on=['Tour ID', self.match_col], how='left')
+
+        # Step 5: Concat back and save
+        summary_remaining = summary[~summary.index.isin(tours_low_before.index)]
+        summary_after_process = pd.concat([summary_remaining, tours_low_after])
+        summary_after_process = summary_after_process.sort_values(['Tour ID', 'Date']).reset_index(drop=True)
+
+        summary_after_process.to_csv(summary_path, index=False)
+        public_path = os.path.join(self.public_dir, f'summary_stacked_{self.time_agg_level}.csv')
+        summary_after_process.to_csv(public_path, index=False)
+
+        # Step 6: Plot
+        self.plot_predictions(summary_after_process, self.time_agg_level, self.level_dir)
+
+    def plot_predictions(self, stacked_df, agg_level, output_dir):
+        os.makedirs(output_dir, exist_ok=True)
+
+        if 'Tour ID' in stacked_df.columns:
+            stacked_df['Tour ID'] = stacked_df['Tour ID'].astype(str).str.replace(r'\.0$', '', regex=True)
+
+        for tour_id in self.predict_tour_ids:
+            print("-" * 50)
+            print(f"DEBUG: 正在尝试为 Tour ID '{tour_id}' (类型: {type(tour_id)}) 绘图")
+            print(f"DEBUG: stacked_df['Tour ID'] 的数据类型是: {stacked_df['Tour ID'].dtype}")
+
+            tour_data = stacked_df[stacked_df['Tour ID'] == str(tour_id)]
+
+            if tour_data.empty:
+                logging.warning(f"在 stacked_df 中找不到 Tour ID '{tour_id}' 的数据，跳过绘图。")
+                similar_ids = [tid for tid in stacked_df['Tour ID'].unique() if str(tour_id) in tid or tid in str(tour_id)]
+                if similar_ids:
+                    print(f"DEBUG: 在 stacked_df 中找到了相似的 ID: {similar_ids}")
+                else:
+                    print(f"DEBUG: 在 stacked_df 中未找到任何与 '{tour_id}' 相似的 ID。")
+                continue
+
+            dates = tour_data['Date']
+            pred_values = tour_data['Pred']
+            adj_pred_values = tour_data['Growth_Adj_Pred']
+            actual_values = tour_data['Actual']
+
+            plt.figure(figsize=(12, 6))
+            plt.plot(dates, pred_values, label='Prediction', marker='x', color='blue', linestyle='--')
+            plt.plot(dates, adj_pred_values, label='Growth Adjusted Prediction', marker='^', color='green', linestyle='-.')
+            plt.plot(dates, actual_values, label='Actual Pax', marker='o', color='black', linestyle='-')
+
+            plt.legend()
+            event_name = self.tour_id_map.get(tour_id, tour_id) if self.tour_id_map else tour_id
+            plt.title(f"{tour_id} - {event_name} Predictions ({agg_level.capitalize()})")
+            plt.xlabel('Date')
+            plt.ylabel('Pax')
+            plt.grid(True)
+
+            date_format = '%Y-%m-%d %H:%M' if agg_level == 'hourly' else '%Y-%m-%d'
+            plt.gca().xaxis.set_major_formatter(mdates.DateFormatter(date_format))
+            plt.gca().xaxis.set_major_locator(mdates.AutoDateLocator())
+            plt.gcf().autofmt_xdate()
+
+            illegal_chars = r'[\<\>\:"/\\|?*]'
+            safe_tour_id = re.sub(illegal_chars, '_', str(tour_id))
+            safe_event_name = re.sub(illegal_chars, '_', str(event_name))
+            filename = f"Reopen Processed_{safe_tour_id}_{safe_event_name}_{agg_level}_predictions.png"
+            filepath = os.path.join(output_dir, filename)
+
+            try:
+                plt.savefig(filepath)
+                logging.info(f"成功保存图表: {filepath}")
+            except Exception as e:
+                logging.error(f"保存图表失败 {filepath}: {e}")
+
+            plt.close()
