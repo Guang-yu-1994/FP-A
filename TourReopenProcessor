@@ -1,0 +1,493 @@
+import os
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import logging
+import re
+from datetime import datetime
+import shutil
+
+class TourReopenProcessor:
+    """
+    处理淡季Tour重开的类
+    """
+    
+    def __init__(self):
+        # 设置基础目录和路径
+        self.BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+        self.INPUT_DIR = os.path.join(self.BASE_DIR, 'Spreadsheets Source')
+        self.OUTPUT_DIR = os.path.join(self.BASE_DIR, 'Outputs')
+        self.PUBLIC_DIR = r"C:\City Experience\Public Data Base"
+        
+        # 设置日志
+        logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+        
+        # 初始化数据存储
+        self.tours_open_data = None
+        self.summary_stacked_data = None
+        self.pax_historical_data = None
+        self.tour_id_map = {}
+        
+    def read_tours_open_data(self, time_agg_level='weekly'):
+        """
+        步骤1: 读取Tours Open in Low Season数据并更新Overall Growth Rate
+        """
+        try:
+            # 读取Tours Open in Low Season.xlsx
+            tours_file = os.path.join(self.INPUT_DIR, 'Tours Open in Low Season.xlsx')
+            self.tours_open_data = pd.read_excel(tours_file)
+            logging.info(f"成功读取Tours Open数据: {tours_file}")
+            
+            # 根据时间级别读取actuals数据
+            actuals_file = os.path.join(
+                self.OUTPUT_DIR, 
+                time_agg_level.capitalize(), 
+                f'actuals_{time_agg_level}_horizontal.csv'
+            )
+            
+            if os.path.exists(actuals_file):
+                actuals_data = pd.read_csv(actuals_file)
+                # 查找Tour ID为'total'的Sigmoid_Growth_Rate值
+                total_growth = actuals_data[actuals_data['Tour ID'] == 'total']['Sigmoid_Growth_Rate'].iloc[0]
+                
+                # 更新Overall Growth Rate
+                self.tours_open_data['Overall Growth Rate'] = total_growth
+                
+                # 覆盖原表格
+                self.tours_open_data.to_excel(tours_file, index=False)
+                logging.info(f"成功更新Overall Growth Rate: {total_growth}")
+            else:
+                logging.warning(f"未找到actuals文件: {actuals_file}")
+                
+            # 创建Tour ID到Event Name的映射
+            self.tour_id_map = dict(zip(
+                self.tours_open_data['Tour ID'].astype(str), 
+                self.tours_open_data['Event Name']
+            ))
+            
+            return self.tours_open_data
+            
+        except Exception as e:
+            logging.error(f"读取Tours Open数据时出错: {e}")
+            raise
+    
+    def read_and_filter_summary_stacked(self, time_agg_level='weekly'):
+        """
+        步骤2: 读取Summary stacked数据并筛选出需要处理的数据
+        """
+        try:
+            # 根据时间级别确定文件路径
+            summary_file = os.path.join(
+                self.OUTPUT_DIR, 
+                time_agg_level.capitalize(), 
+                f'summary_stacked_{time_agg_level}.csv'
+            )
+            
+            self.summary_stacked_data = pd.read_csv(summary_file)
+            self.summary_stacked_data['Date'] = pd.to_datetime(self.summary_stacked_data['Date'])
+            logging.info(f"成功读取Summary stacked数据: {summary_file}")
+            
+            # 筛选需要处理的数据
+            tours_low_season_before = self._filter_low_season_data()
+            
+            return tours_low_season_before
+            
+        except Exception as e:
+            logging.error(f"读取Summary stacked数据时出错: {e}")
+            raise
+    
+    def _filter_low_season_data(self):
+        """
+        筛选出Tours Open in Low Season中的Tour ID在指定日期范围内的数据
+        """
+        if self.tours_open_data is None or self.summary_stacked_data is None:
+            raise ValueError("需要先读取Tours Open和Summary stacked数据")
+        
+        # 转换日期列
+        self.tours_open_data['Open Start Date'] = pd.to_datetime(self.tours_open_data['Open Start Date'])
+        self.tours_open_data['Open End Date'] = pd.to_datetime(self.tours_open_data['Open End Date'])
+        
+        # 筛选条件
+        filtered_data = []
+        
+        for _, tour_row in self.tours_open_data.iterrows():
+            tour_id = str(tour_row['Tour ID'])
+            start_date = tour_row['Open Start Date']
+            end_date = tour_row['Open End Date']
+            
+            # 筛选符合条件的数据
+            mask = (
+                (self.summary_stacked_data['Tour ID'].astype(str) == tour_id) &
+                (self.summary_stacked_data['Date'] >= start_date) &
+                (self.summary_stacked_data['Date'] <= end_date)
+            )
+            
+            tour_data = self.summary_stacked_data[mask].copy()
+            if not tour_data.empty:
+                filtered_data.append(tour_data)
+        
+        if filtered_data:
+            tours_low_season_before = pd.concat(filtered_data, ignore_index=True)
+            logging.info(f"筛选出{len(tours_low_season_before)}条低季数据")
+            return tours_low_season_before
+        else:
+            logging.warning("未找到符合条件的低季数据")
+            return pd.DataFrame()
+    
+    def read_and_process_pax_historical(self, time_agg_level='weekly', reference_years=1):
+        """
+        步骤3: 读取Pax历史数据并处理
+        """
+        try:
+            # 读取grouped_data文件
+            pax_file = os.path.join(self.OUTPUT_DIR, f'grouped_data_{time_agg_level}_True.csv')
+            pax_data = pd.read_csv(pax_file)
+            
+            # 确定日期列名
+            date_col = 'WeekStart' if time_agg_level == 'weekly' else 'Date'
+            pax_data[date_col] = pd.to_datetime(pax_data[date_col])
+            
+            logging.info(f"成功读取Pax历史数据: {pax_file}")
+            
+            # 处理参考年限数据
+            processed_data = self._process_reference_years(pax_data, date_col, reference_years, time_agg_level)
+            
+            return processed_data
+            
+        except Exception as e:
+            logging.error(f"读取Pax历史数据时出错: {e}")
+            raise
+    
+    def _process_reference_years(self, pax_data, date_col, reference_years, time_agg_level):
+        """
+        处理参考年限的同期数据
+        """
+        if self.tours_open_data is None:
+            raise ValueError("需要先读取Tours Open数据")
+        
+        processed_data = []
+        current_year = datetime.now().year
+        
+        for _, tour_row in self.tours_open_data.iterrows():
+            tour_id = str(tour_row['Tour ID'])
+            start_date = tour_row['Open Start Date']
+            end_date = tour_row['Open End Date']
+            overall_growth = tour_row['Overall Growth Rate']
+            additional_growth = tour_row['Expected Additional Growth Rate']
+            
+            # 获取参考年份的同期数据
+            for year_offset in range(1, reference_years + 1):
+                ref_year = current_year - year_offset
+                
+                if time_agg_level == 'weekly':
+                    # 周级别处理
+                    ref_data = self._get_weekly_reference_data(
+                        pax_data, tour_id, start_date, end_date, ref_year, date_col
+                    )
+                else:
+                    # 日级别处理
+                    ref_data = self._get_daily_reference_data(
+                        pax_data, tour_id, start_date, end_date, ref_year, date_col
+                    )
+                
+                if not ref_data.empty:
+                    # 计算Growth_Adj_Pred
+                    ref_data['Growth_Adj_Pred'] = (
+                        ref_data['Actual Pax'] * 
+                        (1 + overall_growth) * 
+                        (1 + additional_growth)
+                    )
+                    processed_data.append(ref_data)
+        
+        if processed_data:
+            result = pd.concat(processed_data, ignore_index=True)
+            logging.info(f"处理了{len(result)}条参考年份数据")
+            return result
+        else:
+            logging.warning("未找到参考年份数据")
+            return pd.DataFrame()
+    
+    def _get_weekly_reference_data(self, pax_data, tour_id, start_date, end_date, ref_year, date_col):
+        """
+        获取周级别的参考年份数据
+        """
+        # 添加周数列
+        pax_data['week_num'] = pax_data[date_col].dt.isocalendar().week
+        pax_data['year'] = pax_data[date_col].dt.year
+        
+        # 计算目标日期范围的周数
+        start_week = start_date.isocalendar()[1]
+        end_week = end_date.isocalendar()[1]
+        
+        # 筛选参考年份的同期周数据
+        mask = (
+            (pax_data['Tour ID'].astype(str) == tour_id) &
+            (pax_data['year'] == ref_year) &
+            (pax_data['week_num'] >= start_week) &
+            (pax_data['week_num'] <= end_week)
+        )
+        
+        return pax_data[mask].copy()
+    
+    def _get_daily_reference_data(self, pax_data, tour_id, start_date, end_date, ref_year, date_col):
+        """
+        获取日级别的参考年份数据
+        """
+        # 计算参考年份的同期日期
+        ref_start = start_date.replace(year=ref_year)
+        ref_end = end_date.replace(year=ref_year)
+        
+        # 筛选参考年份的同期数据
+        mask = (
+            (pax_data['Tour ID'].astype(str) == tour_id) &
+            (pax_data[date_col] >= ref_start) &
+            (pax_data[date_col] <= ref_end)
+        )
+        
+        return pax_data[mask].copy()
+    
+    def process_low_season_data(self, tours_low_season_before, pax_historical_after, time_agg_level='weekly'):
+        """
+        步骤4: 处理Tours low season数据
+        """
+        try:
+            if tours_low_season_before.empty or pax_historical_after.empty:
+                logging.warning("低季数据或历史数据为空，跳过处理")
+                return tours_low_season_before
+            
+            # 选取除Growth_Adj_Pred之外的列
+            columns_to_keep = [col for col in tours_low_season_before.columns if col != 'Growth_Adj_Pred']
+            low_season_subset = tours_low_season_before[columns_to_keep].copy()
+            
+            # 准备连接键
+            date_col = 'WeekStart' if time_agg_level == 'weekly' else 'Date'
+            
+            if time_agg_level == 'weekly':
+                # 为周级别数据添加周数列
+                low_season_subset['week_num'] = low_season_subset['Date'].dt.isocalendar().week
+                low_season_subset['year'] = low_season_subset['Date'].dt.year
+                pax_historical_after['week_num'] = pax_historical_after[date_col].dt.isocalendar().week
+                pax_historical_after['year'] = pax_historical_after[date_col].dt.year
+                
+                # 按Tour ID, week_num, year连接
+                merge_keys = ['Tour ID', 'week_num', 'year']
+            else:
+                # 日级别直接按Tour ID和Date连接
+                merge_keys = ['Tour ID', 'Date']
+                if date_col != 'Date':
+                    pax_historical_after = pax_historical_after.rename(columns={date_col: 'Date'})
+            
+            # 确保Tour ID为字符串类型
+            low_season_subset['Tour ID'] = low_season_subset['Tour ID'].astype(str)
+            pax_historical_after['Tour ID'] = pax_historical_after['Tour ID'].astype(str)
+            
+            # 左连接获取Growth_Adj_Pred
+            tours_low_season_after = pd.merge(
+                low_season_subset,
+                pax_historical_after[merge_keys + ['Growth_Adj_Pred']],
+                on=merge_keys,
+                how='left'
+            )
+            
+            logging.info(f"成功处理低季数据，得到{len(tours_low_season_after)}条记录")
+            return tours_low_season_after
+            
+        except Exception as e:
+            logging.error(f"处理低季数据时出错: {e}")
+            raise
+    
+    def merge_back_to_summary(self, tours_low_season_after, time_agg_level='weekly'):
+        """
+        步骤5: 将处理后的数据合并回Summary stacked
+        """
+        try:
+            if self.summary_stacked_data is None:
+                raise ValueError("需要先读取Summary stacked数据")
+            
+            # 创建合并键来识别需要更新的行
+            if time_agg_level == 'weekly':
+                # 为周级别数据添加周数列
+                self.summary_stacked_data['week_num'] = self.summary_stacked_data['Date'].dt.isocalendar().week
+                self.summary_stacked_data['year'] = self.summary_stacked_data['Date'].dt.year
+                tours_low_season_after['week_num'] = tours_low_season_after['Date'].dt.isocalendar().week
+                tours_low_season_after['year'] = tours_low_season_after['Date'].dt.year
+                merge_keys = ['Tour ID', 'week_num', 'year']
+            else:
+                merge_keys = ['Tour ID', 'Date']
+            
+            # 确保Tour ID为字符串类型
+            self.summary_stacked_data['Tour ID'] = self.summary_stacked_data['Tour ID'].astype(str)
+            tours_low_season_after['Tour ID'] = tours_low_season_after['Tour ID'].astype(str)
+            
+            # 标记需要更新的行
+            temp_marker = 'temp_update_marker'
+            tours_low_season_after[temp_marker] = True
+            
+            # 左连接来标记需要更新的行
+            summary_with_marker = pd.merge(
+                self.summary_stacked_data,
+                tours_low_season_after[merge_keys + [temp_marker, 'Growth_Adj_Pred']],
+                on=merge_keys,
+                how='left',
+                suffixes=('', '_new')
+            )
+            
+            # 更新Growth_Adj_Pred列
+            mask = summary_with_marker[temp_marker].fillna(False)
+            summary_with_marker.loc[mask, 'Growth_Adj_Pred'] = summary_with_marker.loc[mask, 'Growth_Adj_Pred_new']
+            
+            # 清理临时列
+            summary_after_process = summary_with_marker.drop(columns=[temp_marker, 'Growth_Adj_Pred_new'])
+            if time_agg_level == 'weekly':
+                summary_after_process = summary_after_process.drop(columns=['week_num', 'year'])
+            
+            # 保存到原文件
+            original_file = os.path.join(
+                self.OUTPUT_DIR, 
+                time_agg_level.capitalize(), 
+                f'summary_stacked_{time_agg_level}.csv'
+            )
+            summary_after_process.to_csv(original_file, index=False)
+            
+            # 保存到Public Data Base
+            public_file = os.path.join(
+                self.PUBLIC_DIR, 
+                f'summary_stacked_{time_agg_level}.csv'
+            )
+            os.makedirs(self.PUBLIC_DIR, exist_ok=True)
+            summary_after_process.to_csv(public_file, index=False)
+            
+            logging.info(f"成功更新并保存Summary stacked数据")
+            return summary_after_process
+            
+        except Exception as e:
+            logging.error(f"合并数据时出错: {e}")
+            raise
+    
+    def plot_reopen_predictions(self, summary_after_process, time_agg_level='weekly'):
+        """
+        步骤6: 绘制重开Tour的预测图表
+        """
+        try:
+            if self.tours_open_data is None:
+                raise ValueError("需要先读取Tours Open数据")
+            
+            # 创建输出目录
+            plot_dir = os.path.join(self.OUTPUT_DIR, time_agg_level.capitalize())
+            os.makedirs(plot_dir, exist_ok=True)
+            
+            # 强制将Tour ID转换为字符串并去除.0后缀
+            summary_after_process['Tour ID'] = summary_after_process['Tour ID'].astype(str).str.replace(r'\.0$', '', regex=True)
+            
+            # 获取需要绘图的Tour IDs
+            reopen_tour_ids = self.tours_open_data['Tour ID'].astype(str).str.replace(r'\.0$', '', regex=True).tolist()
+            
+            for tour_id in reopen_tour_ids:
+                logging.info(f"正在为Tour ID '{tour_id}' 绘制图表")
+                
+                # 筛选当前Tour的数据
+                tour_data = summary_after_process[summary_after_process['Tour ID'] == tour_id]
+                
+                if tour_data.empty:
+                    logging.warning(f"未找到Tour ID '{tour_id}'的数据，跳过绘图")
+                    continue
+                
+                # 准备绘图数据
+                dates = pd.to_datetime(tour_data['Date'])
+                pred_values = tour_data['Pred']
+                adj_pred_values = tour_data['Growth_Adj_Pred']
+                actual_values = tour_data['Actual']
+                
+                # 创建图表
+                plt.figure(figsize=(12, 6))
+                plt.plot(dates, pred_values, label='Prediction', marker='x', color='blue', linestyle='--')
+                plt.plot(dates, adj_pred_values, label='Growth Adjusted Prediction', marker='^', color='green', linestyle='-.')
+                plt.plot(dates, actual_values, label='Actual Pax', marker='o', color='black', linestyle='-')
+                
+                # 设置图表属性
+                plt.legend()
+                event_name = self.tour_id_map.get(tour_id, tour_id)
+                plt.title(f"{tour_id} - {event_name} Predictions ({time_agg_level.capitalize()})")
+                plt.xlabel('Date')
+                plt.ylabel('Pax')
+                plt.grid(True)
+                
+                # 设置日期格式
+                date_format = '%Y-%m-%d'
+                plt.gca().xaxis.set_major_formatter(mdates.DateFormatter(date_format))
+                plt.gca().xaxis.set_major_locator(mdates.AutoDateLocator())
+                plt.gcf().autofmt_xdate()
+                
+                # 净化文件名
+                illegal_chars = r'[\<\>\:"/\\|?*]'
+                safe_tour_id = re.sub(illegal_chars, '_', str(tour_id))
+                safe_event_name = re.sub(illegal_chars, '_', str(event_name))
+                
+                # 保存图表
+                filename = f"Reopen Processed_{safe_tour_id}_{safe_event_name}_{time_agg_level}_predictions.png"
+                filepath = os.path.join(plot_dir, filename)
+                
+                try:
+                    plt.savefig(filepath)
+                    logging.info(f"成功保存图表: {filepath}")
+                except Exception as e:
+                    logging.error(f"保存图表失败 {filepath}: {e}")
+                
+                plt.close()
+                
+        except Exception as e:
+            logging.error(f"绘制图表时出错: {e}")
+            raise
+    
+    def process_tour_reopen(self, time_agg_level='weekly', reference_years=1):
+        """
+        完整的Tour重开处理流程
+        """
+        try:
+            logging.info("开始处理淡季Tour重开流程")
+            
+            # 步骤1: 读取Tours Open数据
+            logging.info("步骤1: 读取Tours Open数据")
+            self.read_tours_open_data(time_agg_level)
+            
+            # 步骤2: 读取并筛选Summary stacked数据
+            logging.info("步骤2: 读取并筛选Summary stacked数据")
+            tours_low_season_before = self.read_and_filter_summary_stacked(time_agg_level)
+            
+            # 步骤3: 读取并处理Pax历史数据
+            logging.info("步骤3: 读取并处理Pax历史数据")
+            pax_historical_after = self.read_and_process_pax_historical(time_agg_level, reference_years)
+            
+            # 步骤4: 处理低季数据
+            logging.info("步骤4: 处理低季数据")
+            tours_low_season_after = self.process_low_season_data(
+                tours_low_season_before, pax_historical_after, time_agg_level
+            )
+            
+            # 步骤5: 合并回Summary stacked
+            logging.info("步骤5: 合并回Summary stacked")
+            summary_after_process = self.merge_back_to_summary(tours_low_season_after, time_agg_level)
+            
+            # 步骤6: 绘制图表
+            logging.info("步骤6: 绘制图表")
+            self.plot_reopen_predictions(summary_after_process, time_agg_level)
+            
+            logging.info("淡季Tour重开处理完成！")
+            return summary_after_process
+            
+        except Exception as e:
+            logging.error(f"处理过程中出错: {e}")
+            raise
+
+# 使用示例
+if __name__ == "__main__":
+    # 创建处理器实例
+    processor = TourReopenProcessor()
+    
+    # 执行完整处理流程
+    # time_agg_level可以是'weekly'或'daily'
+    # reference_years是参考年限
+    result = processor.process_tour_reopen(time_agg_level='weekly', reference_years=2)
+    
+    print("处理完成！")
