@@ -1,5 +1,89 @@
-代码修正，用英文写代码：
-	1. Reconciliation_Summary需要新增一列Source Folder，用以统计是哪一个文件夹的Source
-	2. 在本工作簿中的sheet1也新增一列Source Folder，用以统计是哪一个文件夹的Source
-	3. 代码优化，我发现整个代码运行下来花很长时间，我有一个计划，就是先粘贴再筛选：可能需要多个临时表来处理目标列，一个列使用一个临时表处理，先将不同xls各列分别粘贴，最后统一筛选清洗，然后汇总。这里注意设计程序统计统计好xls名称和source folder，如果需要新的临时表或者数组来储存就使用，你看着设计。我的想法是每个folder搞这种一回。然后粘贴到汇总，以防内存爆炸，然后清空临时表内容再下一个文件夹。如此循环。等所有的文件夹都循环结束，就需要对汇总表格清洗，需要筛选删除Amount一列为空的行
-Sheet 1不再统计每个xls的时间，而是统计每个文件夹的时间，但是另外新的一列需要统计各个工作簿是否被正确读取。
+帮我写python代码实现处理淡季Tour reopen的一个类，使用相对路径写
+
+# Set base directory and input/output paths
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+INPUT_DIR = os.path.join(BASE_DIR, 'Spreadsheets Source')
+OUTPUT_DIR = os.path.join(BASE_DIR, 'Outputs')
+Public_DIR = "C:\City Experience\Public Data Base"
+我们旅游公司有的Tour在去年淡季没有开放，导致对未来淡季的预测也是0，但是公司决定之后淡季也开放，于是设计这个程序。
+	1. Tours Open in Low Season数据读取。读取文件夹Spreadsheets Source的一张表格Tours Open in Low Season.xlsx，包含列Tour ID，Event Name，Open Start Date，Open End Date，Expected Additional Growth Rate，Overall Growth Rate。其中Overall Growth Rate需要根据传入的时间级别参数（time_agg_level）读取Outputs文件夹下面的Weekly或者Daily（根据时间级别参数）的actuals_weekly_horizontal.csv数据来查找，它等于Tour ID为'total'的Sigmoid_Growth_Rate的值。然后输出覆盖原表格
+	2. Summary stacked数据读取并处理。这里需要根据可传入参数‘时间级别’time_agg_level，如果传入weekly,则读取的是Outputs文件夹的Weekly文件夹下面的summary_stacked_weekly.csv；如果传入daily,则读取的是Outputs文件夹的Daily文件夹下面的summary_stacked_daily.csv。包含列Tour ID，Event Name，Date，Pred，Actual，Growth_Adj_Pred。将Summary stacked的数据根据Tours Open in Low Season数据筛选（如果连接方便可以用连接），目的是将Summary stacked中的Tour ID出现在Tours Open in Low Season的Tour ID,且Date介于Open Start Date和Open End Date之间的数据筛选并分离出来，这部分需要单独处理之后再拼接回去，所以貌似是用pandas的筛选功能比较好？筛出来的数据成为Tours low season data before process，
+	3. Pax历史数据读取及处理。根据传入的时间级别参数，读取Outputs文件夹的的grouped_data_{时间级别}_True.csv，如果是周级别，日期列是WeekStart，日级别的日期列是Date。这里同样需要根据一个可传入参数‘参考年限’，根据这个参数筛选参考年限的和Open Start Date和Open End Date同期的数据。在找参考年同期的时候，请注意时间级别，如果是日级别则直接找同期即可，但是如果是周级别，需要按照WeekStart来找(周级别的数据可能不是同一天，请设计好程序搞这个连接，可以新增临时列是当年第几周)，每年同样第几个周的weekstart是不一样的，然后后面连接的时候也考虑这点。筛选出来之后根据Tour ID左连接Tours Open in Low Season数据，然后新增列Growth_Adj_Pred = Actual Pax * (1+Overall Growth Rate)*(1+Additional Growth Rate）。这个数据是Pax historical data after process
+	4. Tours low season data before process数据处理，将Tours low season data before process数据只选取除了Growth_Adj_Pred之外的列，然后使用Tour ID和Date列（注意周级别的数据可能不是同一天，请设计好程序搞这个连接，可以新增临时列是当年第几周）左连接表格Pax historical data after process(右表使用Tour ID和其对应的日期列），得到Growth_Adj_Pred，得到Tours low season data after process数据
+	5. 将Tours low season data after process数据拼接回之前的Summary stacked的数据。得到Summary stacked after process。将这个数据输出在Summary stacked数据原文件以及public data base文件夹并且以相同名称覆盖之前的数据
+	6. 根据Summary stacked after process画图，仅筛选Tours Open in Low Season数据的Tour ID, 绘制折线图，要求横轴是日期，纵轴是Pax，分别画出Pred,Actual,Growth_Adj_Pred,画图保存在Outputs文件夹下面的Weekly或者Daily（根据时间级别参数），输出的画图名称加上前缀'Reopen Processed'画图样式参考这个函数：
+	def plot_predictions(self, stacked_df, agg_level, output_dir):
+	    os.makedirs(output_dir, exist_ok=True)
+	
+	    # --- 新增的稳健性代码 ---
+	    # 强制将 stacked_df 中的 'Tour ID' 列转换为字符串，并去除 .0 后缀
+	    # 以处理 12345.0 这样的情况
+	    if 'Tour ID' in stacked_df.columns:
+	        stacked_df['Tour ID'] = stacked_df['Tour ID'].astype(str).str.replace(r'\.0$', '', regex=True)
+	    # --- 稳健性代码结束 ---
+	
+	    for tour_id in self.predict_tour_ids:
+	        # --- 新增的调试代码 ---
+	        print("-" * 50)
+	        print(f"DEBUG: 正在尝试为 Tour ID '{tour_id}' (类型: {type(tour_id)}) 绘图")
+	        print(f"DEBUG: stacked_df['Tour ID'] 的数据类型是: {stacked_df['Tour ID'].dtype}")
+	        # --- 调试代码结束 ---
+	
+	        tour_data = stacked_df[stacked_df['Tour ID'] == tour_id]
+	
+	        if tour_data.empty:
+	            logging.warning(f"在 stacked_df 中找不到 Tour ID '{tour_id}' 的数据，跳过绘图。")
+	            # --- 新增的调试代码 ---
+	            # 如果找不到，检查是否存在看起来相似的ID
+	            similar_ids = [tid for tid in stacked_df['Tour ID'].unique() if tour_id in tid or tid in tour_id]
+	            if similar_ids:
+	                print(f"DEBUG: 在 stacked_df 中找到了相似的 ID: {similar_ids}")
+	            else:
+	                print(f"DEBUG: 在 stacked_df 中未找到任何与 '{tour_id}' 相似的 ID。")
+	            # --- 调试代码结束 ---
+	            continue
+	
+	        dates = tour_data['Date']
+	        pred_values = tour_data['Pred']
+	        adj_pred_values = tour_data['Growth_Adj_Pred']
+	        actual_values = tour_data['Actual']
+	
+	        plt.figure(figsize=(12, 6))
+	        plt.plot(dates, pred_values, label='Prediction', marker='x', color='blue', linestyle='--')
+	        plt.plot(dates, adj_pred_values, label='Growth Adjusted Prediction', marker='^', color='green',
+	                 linestyle='-.')
+	        plt.plot(dates, actual_values, label='Actual Pax', marker='o', color='black', linestyle='-')
+	
+	        plt.legend()
+	        event_name = self.tour_id_map.get(tour_id, tour_id) if self.tour_id_map else tour_id
+	        plt.title(f"{tour_id} - {event_name} Predictions ({agg_level.capitalize()})")
+	        plt.xlabel('Date')
+	        plt.ylabel('Pax')
+	        plt.grid(True)
+	
+	        date_format = '%Y-%m-%d %H:%M' if agg_level == 'hourly' else '%Y-%m-%d'
+	        plt.gca().xaxis.set_major_formatter(mdates.DateFormatter(date_format))
+	        plt.gca().xaxis.set_major_locator(mdates.AutoDateLocator())
+	        plt.gcf().autofmt_xdate()
+	
+	        # --- 修改后的文件名净化代码 ---
+	        # 定义在Windows文件名中非法的字符集
+	        illegal_chars = r'[\<\>\:"/\\|?*]'
+	
+	        # 净化 tour_id 和 event_name
+	        safe_tour_id = re.sub(illegal_chars, '_', str(tour_id))
+	        safe_event_name = re.sub(illegal_chars, '_', str(event_name))
+	
+	        # 构建安全的文件名和完整路径
+	        filename = f"{safe_tour_id}_{safe_event_name}_{agg_level}_predictions.png"
+	        filepath = os.path.join(output_dir, filename)
+	
+	        # 使用 try-except 块来增加保存文件操作的稳健性
+	        try:
+	            plt.savefig(filepath)
+	            logging.info(f"成功保存图表: {filepath}")
+	        except Exception as e:
+	            logging.error(f"保存图表失败 {filepath}: {e}")
+	
+	        plt.close()
+        # --- 修改结束 ---
