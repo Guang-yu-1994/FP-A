@@ -135,7 +135,7 @@ class TourReopenProcessor:
             logging.warning("未找到符合条件的低季数据")
             return pd.DataFrame()
     
-    def read_and_process_pax_historical(self, time_agg_level='weekly', reference_years=1):
+    def read_and_process_pax_historical(self, time_agg_level='weekly', reference_years=[2024, 2023]):
         """
         步骤3: 读取Pax历史数据并处理
         """
@@ -148,7 +148,8 @@ class TourReopenProcessor:
             date_col = 'WeekStart' if time_agg_level == 'weekly' else 'Date'
             pax_data[date_col] = pd.to_datetime(pax_data[date_col])
             
-            logging.info(f"成功读取Pax历史数据: {pax_file}")
+            logging.info(f"成功读取Pax历史数据: {pax_file}, 共{len(pax_data)}条记录")
+            logging.info(f"数据日期范围: {pax_data[date_col].min()} 到 {pax_data[date_col].max()}")
             
             # 处理参考年限数据
             processed_data = self._process_reference_years(pax_data, date_col, reference_years, time_agg_level)
@@ -167,7 +168,12 @@ class TourReopenProcessor:
             raise ValueError("需要先读取Tours Open数据")
         
         processed_data = []
-        current_year = datetime.now().year
+        
+        # 如果reference_years是单个值，转换为列表
+        if isinstance(reference_years, (int, str)):
+            reference_years = [reference_years]
+        
+        logging.info(f"开始处理参考年份: {reference_years}")
         
         for _, tour_row in self.tours_open_data.iterrows():
             tour_id = str(tour_row['Tour ID'])
@@ -176,9 +182,12 @@ class TourReopenProcessor:
             overall_growth = tour_row['Overall Growth Rate']
             additional_growth = tour_row['Expected Additional Growth Rate']
             
+            logging.info(f"处理Tour ID: {tour_id}, 日期范围: {start_date} 到 {end_date}")
+            
             # 获取参考年份的同期数据
-            for year_offset in range(1, reference_years + 1):
-                ref_year = current_year - year_offset
+            for ref_year in reference_years:
+                ref_year = int(ref_year)  # 确保是整数
+                logging.info(f"  查找{ref_year}年的参考数据")
                 
                 if time_agg_level == 'weekly':
                     # 周级别处理
@@ -192,6 +201,7 @@ class TourReopenProcessor:
                     )
                 
                 if not ref_data.empty:
+                    logging.info(f"    找到{len(ref_data)}条{ref_year}年的数据")
                     # 计算Growth_Adj_Pred
                     ref_data['Growth_Adj_Pred'] = (
                         ref_data['Actual Pax'] * 
@@ -199,13 +209,15 @@ class TourReopenProcessor:
                         (1 + additional_growth)
                     )
                     processed_data.append(ref_data)
+                else:
+                    logging.warning(f"    未找到Tour ID {tour_id}在{ref_year}年的参考数据")
         
         if processed_data:
             result = pd.concat(processed_data, ignore_index=True)
-            logging.info(f"处理了{len(result)}条参考年份数据")
+            logging.info(f"总共处理了{len(result)}条参考年份数据")
             return result
         else:
-            logging.warning("未找到参考年份数据")
+            logging.warning("未找到任何参考年份数据")
             return pd.DataFrame()
     
     def _get_weekly_reference_data(self, pax_data, tour_id, start_date, end_date, ref_year, date_col):
@@ -220,6 +232,8 @@ class TourReopenProcessor:
         start_week = start_date.isocalendar()[1]
         end_week = end_date.isocalendar()[1]
         
+        logging.info(f"      查找周数范围: 第{start_week}周到第{end_week}周")
+        
         # 筛选参考年份的同期周数据
         mask = (
             (pax_data['Tour ID'].astype(str) == tour_id) &
@@ -228,15 +242,41 @@ class TourReopenProcessor:
             (pax_data['week_num'] <= end_week)
         )
         
-        return pax_data[mask].copy()
+        result = pax_data[mask].copy()
+        
+        # 调试信息
+        available_years = pax_data[pax_data['Tour ID'].astype(str) == tour_id]['year'].unique()
+        available_weeks = pax_data[
+            (pax_data['Tour ID'].astype(str) == tour_id) & 
+            (pax_data['year'] == ref_year)
+        ]['week_num'].unique()
+        
+        logging.info(f"      Tour {tour_id}可用年份: {sorted(available_years)}")
+        logging.info(f"      {ref_year}年可用周数: {sorted(available_weeks)}")
+        
+        return result
     
     def _get_daily_reference_data(self, pax_data, tour_id, start_date, end_date, ref_year, date_col):
         """
         获取日级别的参考年份数据
         """
         # 计算参考年份的同期日期
-        ref_start = start_date.replace(year=ref_year)
-        ref_end = end_date.replace(year=ref_year)
+        try:
+            ref_start = start_date.replace(year=ref_year)
+            ref_end = end_date.replace(year=ref_year)
+        except ValueError:
+            # 处理闰年的2月29日情况
+            if start_date.month == 2 and start_date.day == 29:
+                ref_start = start_date.replace(year=ref_year, day=28)
+            else:
+                ref_start = start_date.replace(year=ref_year)
+            
+            if end_date.month == 2 and end_date.day == 29:
+                ref_end = end_date.replace(year=ref_year, day=28)
+            else:
+                ref_end = end_date.replace(year=ref_year)
+        
+        logging.info(f"      查找日期范围: {ref_start} 到 {ref_end}")
         
         # 筛选参考年份的同期数据
         mask = (
@@ -245,7 +285,19 @@ class TourReopenProcessor:
             (pax_data[date_col] <= ref_end)
         )
         
-        return pax_data[mask].copy()
+        result = pax_data[mask].copy()
+        
+        # 调试信息
+        available_years = pax_data[pax_data['Tour ID'].astype(str) == tour_id][date_col].dt.year.unique()
+        available_dates = pax_data[
+            (pax_data['Tour ID'].astype(str) == tour_id) & 
+            (pax_data[date_col].dt.year == ref_year)
+        ][date_col].dt.date.unique()
+        
+        logging.info(f"      Tour {tour_id}可用年份: {sorted(available_years)}")
+        logging.info(f"      {ref_year}年可用日期数量: {len(available_dates)}")
+        
+        return result
     
     def process_low_season_data(self, tours_low_season_before, pax_historical_after, time_agg_level='weekly'):
         """
@@ -440,7 +492,7 @@ class TourReopenProcessor:
             logging.error(f"绘制图表时出错: {e}")
             raise
     
-    def process_tour_reopen(self, time_agg_level='weekly', reference_years=1):
+    def process_tour_reopen(self, time_agg_level='weekly', reference_years=[2024, 2023]):
         """
         完整的Tour重开处理流程
         """
@@ -487,7 +539,7 @@ if __name__ == "__main__":
     
     # 执行完整处理流程
     # time_agg_level可以是'weekly'或'daily'
-    # reference_years是参考年限
-    result = processor.process_tour_reopen(time_agg_level='weekly', reference_years=2)
+    # reference_years现在是具体年份列表，如[2024, 2023]或[2024]
+    result = processor.process_tour_reopen(time_agg_level='weekly', reference_years=[2024, 2023])
     
     print("处理完成！")
