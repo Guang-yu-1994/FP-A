@@ -1,0 +1,714 @@
+import os
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import logging
+import re
+from datetime import datetime, timedelta
+import shutil
+
+
+class TourReopenProcessor:
+    """
+    处理淡季Tour重开的类
+    """
+
+    def __init__(self):
+        # 设置基础目录和路径
+        self.BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+        self.INPUT_DIR = os.path.join(self.BASE_DIR, 'Spreadsheets Source')
+        self.OUTPUT_DIR = os.path.join(self.BASE_DIR, 'Outputs')
+        self.PUBLIC_DIR = r"C:\City Experience\Public Data Base"  # 保持绝对路径
+
+        # 设置日志
+        logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+        # 初始化数据存储
+        self.tours_open_data = None
+        self.summary_stacked_data = None
+        self.tour_id_map = {}
+        self.low_season_start_date_map = {}  # 新增：存储每个 Tour ID 的 "孰晚" 开始日期
+
+    def _clean_tour_id_column(self, df, column_name='Tour ID'):
+        """
+        辅助函数：确保 Tour ID 列是字符串类型并移除 '.0' 后缀。
+        """
+        if column_name in df.columns:
+            try:
+                # 尝试将可能是浮点数的数字转换为整数，再转字符串
+                # 使用 Int64Dtype 处理 NaN 值
+                df[column_name] = df[column_name].astype(float).astype(pd.Int64Dtype()).astype(str)
+            except (ValueError, TypeError):
+                # 如果有非数字Tour ID，则直接转为字符串并清理
+                df[column_name] = df[column_name].astype(str)
+
+            df[column_name] = df[column_name].str.replace(r'\.0$', '', regex=True)
+            df[column_name] = df[column_name].str.strip()  # 移除可能的空白字符
+        return df
+
+    def read_tours_open_data(self, time_agg_level='weekly'):
+        """
+        步骤1: 读取Tours Open in Low Season数据，更新Overall Growth Rate，并覆盖保存回原文件。
+        *** 修正 v4: 确保连接正确，并恢复将更新结果覆盖写回原始 Excel 文件的功能 ***
+        """
+        try:
+            # 定义文件路径和列名
+            tours_file = os.path.join(self.INPUT_DIR, 'Tours Open in Low Season.xlsx')
+            actuals_file_path = os.path.join(
+                self.OUTPUT_DIR,
+                time_agg_level.capitalize(),
+                f'actuals_{time_agg_level}_horizontal.csv'
+            )
+            growth_rate_col_name = 'Growth_Rate'
+
+            # 1. 读取基础的 Tours Open 配置
+            self.tours_open_data = pd.read_excel(tours_file)
+            logging.info(f"成功读取Tours Open数据: {tours_file}")
+
+            # 清理和预处理
+            self.tours_open_data = self._clean_tour_id_column(self.tours_open_data)
+            self.tours_open_data['Open Start Date'] = pd.to_datetime(self.tours_open_data['Open Start Date'])
+            self.tours_open_data['Open End Date'] = pd.to_datetime(self.tours_open_data['Open End Date'])
+
+            # 验证 Reference Year
+            if 'Reference Year' not in self.tours_open_data.columns:
+                raise ValueError("Tours Open 数据缺少 'Reference Year' 字段，请检查表格。")
+            if self.tours_open_data['Reference Year'].isnull().any():
+                invalid_tours = self.tours_open_data[self.tours_open_data['Reference Year'].isnull()]
+                raise ValueError(
+                    f"以下 Tour 的 'Reference Year' 为空，请检查数据:\n{invalid_tours[['Tour ID', 'Reference Year']]}")
+
+            # 2. 从 actuals 文件获取 Growth_Rate 并更新
+            if not os.path.exists(actuals_file_path):
+                logging.warning(f"Actuals 文件未找到: {actuals_file_path}。将跳过 'Overall Growth Rate' 的更新。")
+            else:
+                logging.info(f"正在从 {actuals_file_path} 读取 {growth_rate_col_name} 以更新 'Overall Growth Rate'...")
+                actuals_df = pd.read_csv(actuals_file_path)
+                actuals_df = self._clean_tour_id_column(actuals_df)
+
+                if growth_rate_col_name in actuals_df.columns:
+                    growth_rates_lookup = actuals_df[['Tour ID', growth_rate_col_name]].drop_duplicates(
+                        subset=['Tour ID'])
+
+                    # 强制 Tour ID 为字符串类型以确保连接成功
+                    self.tours_open_data['Tour ID'] = self.tours_open_data['Tour ID'].astype(str)
+                    growth_rates_lookup['Tour ID'] = growth_rates_lookup['Tour ID'].astype(str)
+
+                    # 执行左连接
+                    self.tours_open_data = pd.merge(
+                        self.tours_open_data,
+                        growth_rates_lookup,
+                        on='Tour ID',
+                        how='left'
+                    )
+
+                    # 更新 'Overall Growth Rate' 列
+                    updated_mask = self.tours_open_data[growth_rate_col_name].notna()
+                    logging.info(f"连接成功！将为 {updated_mask.sum()} 个 Tour 更新 'Overall Growth Rate'。")
+                    self.tours_open_data.loc[updated_mask, 'Overall Growth Rate'] = self.tours_open_data.loc[
+                        updated_mask, growth_rate_col_name]
+                    self.tours_open_data.drop(columns=[growth_rate_col_name], inplace=True)
+                else:
+                    logging.warning(f"Actuals 文件 {actuals_file_path} 中缺少 '{growth_rate_col_name}' 列。跳过更新。")
+
+            # --- [核心功能添加] ---
+            # 3. 将更新后的 DataFrame 覆盖写回原始 Excel 文件
+            try:
+                logging.info(f"正在将更新后的数据覆盖保存回原始文件: {tours_file}")
+                # 使用 to_excel 保存，index=False 避免写入 DataFrame 的索引列，这至关重要
+                self.tours_open_data.to_excel(tours_file, index=False)
+                logging.info(f"成功覆盖文件: {tours_file}")
+            except Exception as e:
+                logging.error(f"覆盖原始 Excel 文件时发生错误: {e}", exc_info=True)
+                # 即使写入失败，程序也继续执行，但会发出警告
+            # --------------------
+
+            # 4. 存储最终的映射关系以供后续步骤使用
+            self.tour_id_map = dict(zip(self.tours_open_data['Tour ID'], self.tours_open_data['Event Name']))
+            self.reference_year_map = dict(zip(self.tours_open_data['Tour ID'], self.tours_open_data['Reference Year']))
+
+            return self.tours_open_data
+
+        except Exception as e:
+            logging.error(f"读取并处理 Tours Open 数据时出错: {e}", exc_info=True)
+            raise
+
+
+
+    def read_and_filter_summary_stacked(self, time_agg_level='weekly'):
+        """
+        步骤2: 读取Summary stacked数据，确定“孰晚”开始日期，并筛选出需要处理的数据。
+        """
+        try:
+            summary_file = os.path.join(
+                self.OUTPUT_DIR,
+                time_agg_level.capitalize(),
+                f'summary_stacked_{time_agg_level}.csv'
+            )
+
+            if not os.path.exists(summary_file):
+                logging.error(f"Summary stacked 文件未找到: {summary_file}")
+                raise FileNotFoundError(f"Summary stacked file not found: {summary_file}")
+
+            self.summary_stacked_data = pd.read_csv(summary_file)
+            self.summary_stacked_data = self._clean_tour_id_column(self.summary_stacked_data)
+            logging.debug(
+                f"Summary stacked data 'Tour ID's cleaned. Example: {self.summary_stacked_data['Tour ID'].head().tolist()}")
+
+            self.summary_stacked_data['Date'] = pd.to_datetime(self.summary_stacked_data['Date'])
+            logging.info(f"成功读取Summary stacked数据: {summary_file}")
+
+            # --- 新增逻辑：确定“孰晚”日期 ---
+            self.low_season_start_date_map = {}
+            for _, tour_row in self.tours_open_data.iterrows():
+                tour_id = tour_row['Tour ID']
+                open_start_date = tour_row['Open Start Date']
+
+                # 筛选当前 Tour ID 的 Summary Stacked 数据中 Actual 不为空的最新日期
+                tour_summary_data = self.summary_stacked_data[self.summary_stacked_data['Tour ID'] == tour_id]
+                latest_actual_date = tour_summary_data[tour_summary_data['Actual'].notna()]['Date'].max()
+
+                if pd.isna(latest_actual_date):
+                    # 如果没有 Actual 数据，则使用 Open Start Date
+                    孰晚日期 = open_start_date
+                    logging.debug(
+                        f"  Tour ID '{tour_id}': 没有 Actual 数据，使用 Open Start Date: {孰晚日期.strftime('%Y-%m-%d')}")
+                else:
+                    # 取 Open Start Date 和 latest_actual_date 的孰晚
+                    孰晚日期 = max(open_start_date, latest_actual_date)
+                    logging.debug(
+                        f"  Tour ID '{tour_id}': Open Start Date: {open_start_date.strftime('%Y-%m-%d')}, Latest Actual Date: {latest_actual_date.strftime('%Y-%m-%d')}. '孰晚'日期: {孰晚日期.strftime('%Y-%m-%d')}")
+
+                self.low_season_start_date_map[tour_id] = 孰晚日期
+            # --- “孰晚”日期逻辑结束 ---
+
+            # 筛选需要处理的数据
+            tours_low_season_before = self._filter_low_season_data()
+
+            return tours_low_season_before
+
+        except Exception as e:
+            logging.error(f"读取Summary stacked数据时出错: {e}", exc_info=True)
+            raise
+
+    def _filter_low_season_data(self):
+        """
+        将 Summary stacked 数据分为两部分：
+        1. 筛选出 Tours Open in Low Season 的数据；
+        2. 剩余的 Summary stacked 数据。
+        """
+        if self.tours_open_data is None or self.summary_stacked_data is None or not self.low_season_start_date_map:
+            raise ValueError("需要先读取 Tours Open 和 Summary stacked 数据，并计算 '孰晚' 日期。")
+
+        filtered_data_list = []
+        filtered_indices = set()  # 用于记录筛选部分的索引
+
+        for _, tour_row in self.tours_open_data.iterrows():
+            tour_id = tour_row['Tour ID']
+            open_end_date = tour_row['Open End Date']
+
+            # 使用“孰晚”日期作为开始日期
+            actual_start_date = self.low_season_start_date_map.get(tour_id)
+            if actual_start_date is None:
+                logging.warning(f"Tour ID '{tour_id}' 没有对应的 '孰晚' 日期，跳过筛选。")
+                continue
+
+            # 筛选当前 Tour ID 且日期在 [actual_start_date, open_end_date] 范围内的数据
+            mask = (
+                    (self.summary_stacked_data['Tour ID'] == tour_id) &
+                    (self.summary_stacked_data['Date'] >= actual_start_date) &
+                    (self.summary_stacked_data['Date'] <= open_end_date)
+            )
+
+            tour_data = self.summary_stacked_data[mask].copy()
+            if not tour_data.empty:
+                filtered_data_list.append(tour_data)
+                filtered_indices.update(self.summary_stacked_data[mask].index)
+
+        if filtered_data_list:
+            tours_low_season_before = pd.concat(filtered_data_list, ignore_index=True)
+            logging.info(f"根据 '孰晚' 日期筛选出 {len(tours_low_season_before)} 条淡季 Tour 数据。")
+            logging.debug(
+                f"筛选出的淡季数据示例 (Tour ID, Date): \n{tours_low_season_before[['Tour ID', 'Date']].head()}")
+        else:
+            logging.warning("未找到符合条件的淡季 Tour 数据 (基于 '孰晚' 日期)。")
+            tours_low_season_before = pd.DataFrame(columns=self.summary_stacked_data.columns)  # 返回空 DataFrame 但保持列结构
+
+        # 获取剩余部分数据
+        remaining_data = self.summary_stacked_data.drop(index=filtered_indices)
+        logging.info(f"分离出 {len(remaining_data)} 条剩余的 Summary stacked 数据。")
+
+        return tours_low_season_before, remaining_data
+
+    def read_and_process_pax_historical(self, time_agg_level='weekly', reference_years=None):
+        """
+        步骤3: 读取Pax历史数据并处理。
+        根据传入的时间级别和参考年份，查找同期数据并计算 Growth_Adj_Pred。
+        *** 修正: 移除了在函数末尾强制修改年份的错误代码，以真正实现跨年功能 ***
+        """
+        if reference_years is None:
+            reference_years = []
+
+        try:
+            pax_file = os.path.join(self.OUTPUT_DIR, f'grouped_data_{time_agg_level}_True.csv')
+
+            if not os.path.exists(pax_file):
+                logging.error(f"Pax 历史数据文件未找到: {pax_file}")
+                raise FileNotFoundError(f"Pax historical data file not found: {pax_file}")
+
+            pax_data = pd.read_csv(pax_file)
+            pax_data = self._clean_tour_id_column(pax_data)
+
+            date_col = 'WeekStart' if time_agg_level == 'weekly' else 'Date'
+            if date_col not in pax_data.columns:
+                raise ValueError(f"Missing date column '{date_col}' in pax historical data.")
+
+            pax_data[date_col] = pd.to_datetime(pax_data[date_col])
+            logging.info(f"成功读取Pax历史数据: {pax_file}, 共 {len(pax_data)} 条记录")
+
+            processed_data = self._process_reference_years(pax_data, date_col, time_agg_level)
+
+            return processed_data
+
+        except Exception as e:
+            logging.error(f"读取 Pax 历史数据时出错: {e}", exc_info=True)
+            raise
+
+    def _process_reference_years(self, pax_data, date_col, time_agg_level):
+        """
+        处理参考年限的同期数据。
+        每个 Tour ID 动态使用其对应的 Reference Year。
+        """
+        if self.tours_open_data is None or not self.low_season_start_date_map:
+            raise ValueError("需要先读取 Tours Open 数据和计算'孰晚'日期。")
+
+        processed_data_list = []
+
+        if 'Actual Pax' not in pax_data.columns:
+            raise ValueError("Missing 'Actual Pax' column in pax historical data.")
+
+        for _, tour_row in self.tours_open_data.iterrows():
+            tour_id = tour_row['Tour ID']
+            open_end_date = tour_row['Open End Date']
+            overall_growth = tour_row['Overall Growth Rate']
+            additional_growth = tour_row['Expected Additional Growth Rate']
+            reference_year = self.reference_year_map.get(tour_id)
+
+            if reference_year is None or pd.isna(reference_year):
+                logging.warning(f"Tour ID '{tour_id}' 缺少 Reference Year，跳过处理。")
+                continue
+
+            actual_start_date = self.low_season_start_date_map.get(tour_id)
+            if actual_start_date is None:
+                logging.warning(f"Tour ID '{tour_id}' 没有对应的 '孰晚' 日期，跳过。")
+                continue
+
+            logging.info(f"处理 Tour ID: '{tour_id}', 目标日期: {actual_start_date.strftime('%Y-%m-%d')} 到 {open_end_date.strftime('%Y-%m-%d')}")
+            logging.info(f"  参考年份: {reference_year}")
+
+            tour_pax_data = pax_data[pax_data['Tour ID'] == tour_id].copy()
+
+            if tour_pax_data.empty:
+                logging.warning(f"  在 Pax 历史数据中未找到 Tour ID '{tour_id}' 的记录。")
+                continue
+
+            if time_agg_level == 'weekly':
+                ref_data_for_year = self._get_weekly_reference_data_with_late_start(
+                    tour_pax_data, tour_id, actual_start_date, open_end_date, int(reference_year), date_col
+                )
+            else: # daily
+                ref_data_for_year = self._get_daily_reference_data_with_late_start(
+                    tour_pax_data, tour_id, actual_start_date, open_end_date, int(reference_year), date_col
+                )
+
+            if not ref_data_for_year.empty:
+                logging.info(f"    找到 {len(ref_data_for_year)} 条 Tour ID '{tour_id}' 在参考期的数据。")
+
+                ref_data_for_year['Growth_Adj_Pred'] = (
+                        ref_data_for_year['Actual Pax'] *
+                        (1 + overall_growth) *
+                        (1 + additional_growth)
+                ).round().astype(int)
+
+                # --- 【核心修正】: 下面这行错误的代码已被彻底移除 ---
+                # 之前这里有一行 ref_data_for_year['Date'] = ref_data_for_year['Date'].apply(...)
+                # 它会强制把所有年份都改成 actual_start_date.year (2025)，导致跨年逻辑失效。
+                # 正确的日期平移逻辑已经在 _get_weekly_reference_data_with_late_start 内部完成。
+
+                processed_data_list.append(ref_data_for_year)
+            else:
+                logging.warning(f"    未找到 Tour ID '{tour_id}' 在参考年份 {reference_year} 的参考数据。")
+
+        if processed_data_list:
+            result = pd.concat(processed_data_list, ignore_index=True)
+            logging.info(f"总共处理了 {len(result)} 条参考年份数据。")
+            return result
+        else:
+            logging.warning("未找到任何参考年份数据。返回空 DataFrame。")
+            return pd.DataFrame(columns=['Tour ID', 'Date', 'Actual Pax', 'Growth_Adj_Pred'])
+
+
+
+    def _get_weekly_reference_data_with_late_start(self, tour_pax_data_filtered, tour_id, actual_start_date,
+                                                   open_end_date, ref_year, date_col):
+        """
+        获取周级别的参考年份数据，考虑“孰晚”开始日期和跨年时长。
+        """
+        try:
+            # --- [核心修正：处理跨年逻辑] ---
+            # 1. 计算参考周期的开始日期
+            # 使用 try-except 处理2月29日这种特殊情况
+            try:
+                ref_start = actual_start_date.replace(year=ref_year)
+            except ValueError:
+                # 如果目标开始日期是2月29日，而参考年不是闰年，则替换为2月28日
+                ref_start = actual_start_date.replace(year=ref_year, day=28)
+
+            # 2. 计算目标周期的精确时长
+            duration = open_end_date - actual_start_date
+
+            # 3. 计算参考周期的结束日期 = 参考开始日期 + 时长
+            ref_end = ref_start + duration
+
+            logging.info(
+                f"  跨年逻辑已启用。查找参考年份 {ref_year} 的数据，完整时间范围: {ref_start.strftime('%Y-%m-%d')} 到 {ref_end.strftime('%Y-%m-%d')}")
+
+            # 4. 根据计算出的参考周期范围，筛选历史数据
+            mask = (
+                    (tour_pax_data_filtered[date_col] >= ref_start) &
+                    (tour_pax_data_filtered[date_col] <= ref_end)
+            )
+            result = tour_pax_data_filtered[mask].copy()
+
+            # 5. 将找到的历史数据的日期，平移到目标年份以便后续合并
+            # 日期偏移量 = 目标开始日期 - 参考开始日期
+            date_offset = actual_start_date - ref_start
+            result['Date'] = result[date_col] + date_offset
+
+            logging.info(f"  筛选后参考年份数据共 {len(result)} 条记录。")
+            logging.debug(f"  筛选后数据示例 (原始日期, 平移后日期):\n{result[['Tour ID', date_col, 'Date']].head()}")
+
+            return result
+
+        except Exception as e:
+            logging.error(f"获取周级别参考年份数据时出错: {e}", exc_info=True)
+            raise
+
+    def _get_daily_reference_data_with_late_start(self, tour_pax_data_filtered, tour_id, actual_start_date,
+                                                  open_end_date, ref_year, date_col):
+        """
+        获取日级别的参考年份数据，考虑“孰晚”开始日期和跨年时长。
+        """
+        try:
+            # --- [核心修正：处理跨年逻辑] ---
+            # 1. 计算参考周期的开始日期
+            # 使用 try-except 处理2月29日这种特殊情况
+            try:
+                ref_start = actual_start_date.replace(year=ref_year)
+            except ValueError:
+                # 如果目标开始日期是2月29日，而参考年不是闰年，则替换为2月28日
+                ref_start = actual_start_date.replace(year=ref_year, day=28)
+
+            # 2. 计算目标周期的精确时长
+            duration = open_end_date - actual_start_date
+
+            # 3. 计算参考周期的结束日期 = 参考开始日期 + 时长
+            ref_end = ref_start + duration
+
+            logging.info(
+                f"      跨年逻辑已启用。查找目标日期范围 (参考年 {ref_year}): {ref_start.strftime('%Y-%m-%d')} 到 {ref_end.strftime('%Y-%m-%d')}")
+
+            # 4. 根据计算出的参考周期范围，筛选历史数据
+            mask = (
+                    (tour_pax_data_filtered[date_col] >= ref_start) &
+                    (tour_pax_data_filtered[date_col] <= ref_end)
+            )
+            result = tour_pax_data_filtered[mask].copy()
+
+            # 调试信息
+            if not tour_pax_data_filtered.empty:
+                available_years = tour_pax_data_filtered[date_col].dt.year.unique()
+                logging.debug(f"      Tour '{tour_id}' 在 Pax 历史数据中可用年份: {sorted(available_years)}")
+            else:
+                logging.debug(f"      Tour '{tour_id}' 在 Pax 历史数据中没有记录。")
+
+            return result
+
+        except Exception as e:
+            logging.error(f"获取日级别参考年份数据时出错: {e}", exc_info=True)
+            raise
+
+    def process_low_season_data(self, tours_low_season_before_process, pax_historical_data_after_process):
+        """
+        步骤4: 处理Tours low season数据。
+        现在，这个函数的主要作用是确保 `tours_low_season_before_process` 中的记录
+        被 `pax_historical_data_after_process` 中的 `Growth_Adj_Pred` 值覆盖。
+        我们不再进行额外的连接，而是直接利用 `pax_historical_data_after_process`
+        作为“处理后的淡季数据”，因为它已经包含了调整后的预测。
+        """
+        # 实际上，pax_historical_data_after_process 已经是我们想要合并到 summary_stacked_data 中的数据
+        # 它包含了针对淡季 Tour ID 和日期计算出的 Growth_Adj_Pred
+
+        # 确保返回的数据只包含 Tour ID, Date, Growth_Adj_Pred
+        # 同时保留 tours_low_season_before_process 中的其他列，并用新计算的 Growth_Adj_Pred 覆盖
+        if tours_low_season_before_process.empty or pax_historical_data_after_process.empty:
+            logging.warning("低季数据或历史处理数据为空。返回原始低季数据，并尝试用 Pred 填充 Growth_Adj_Pred。")
+            if 'Growth_Adj_Pred' not in tours_low_season_before_process.columns:
+                tours_low_season_before_process['Growth_Adj_Pred'] = np.nan
+            tours_low_season_before_process['Growth_Adj_Pred'] = tours_low_season_before_process[
+                'Growth_Adj_Pred'].fillna(tours_low_season_before_process['Pred'])
+            return tours_low_season_before_process
+
+        # 创建一个副本，以便在上面更新 Growth_Adj_Pred
+        tours_low_season_after_process = tours_low_season_before_process.copy()
+
+        # 确保 Growth_Adj_Pred 列存在
+        if 'Growth_Adj_Pred' not in tours_low_season_after_process.columns:
+            tours_low_season_after_process['Growth_Adj_Pred'] = np.nan
+
+        # 使用 DataFrame.update 来根据 'Tour ID' 和 'Date' 更新 Growth_Adj_Pred
+        # 需要确保两者的索引对齐或使用相同的合并键作为索引
+        merge_keys = ['Tour ID', 'Date']
+
+        indexed_low_season = tours_low_season_after_process.set_index(merge_keys)
+        indexed_pax_historical = pax_historical_data_after_process.set_index(merge_keys)
+
+        indexed_low_season.update(indexed_pax_historical[['Growth_Adj_Pred']], overwrite=True)
+
+        tours_low_season_after_process = indexed_low_season.reset_index()
+
+        # 对于那些在 pax_historical_data_after_process 中没有对应记录的淡季数据，
+        # 其 Growth_Adj_Pred 仍为 NaN。此时用其 Pred 值填充。
+        tours_low_season_after_process['Growth_Adj_Pred'] = tours_low_season_after_process['Growth_Adj_Pred'].fillna(
+            tours_low_season_after_process['Pred'])
+
+        logging.info(f"成功处理低季数据，得到 {len(tours_low_season_after_process)} 条记录。")
+        logging.debug(
+            f"处理后的低季数据示例 (Tour ID, Date, Pred, Growth_Adj_Pred): \n{tours_low_season_after_process[['Tour ID', 'Date', 'Pred', 'Growth_Adj_Pred']].head()}")
+        return tours_low_season_after_process
+
+    def merge_back_to_summary(self, processed_data, remaining_data, time_agg_level='weekly'):
+        """
+        将处理后的参考年度数据与 Summary stacked 的剩余部分拼接，并保存到文件。
+        """
+        try:
+            # 检查输入参数是否为 DataFrame
+            if not isinstance(processed_data, pd.DataFrame):
+                raise TypeError(
+                    "processed_data 应为 DataFrame 对象，但收到的是: {}".format(type(processed_data).__name__))
+            if not isinstance(remaining_data, pd.DataFrame):
+                raise TypeError(
+                    "remaining_data 应为 DataFrame 对象，但收到的是: {}".format(type(remaining_data).__name__))
+
+            # 保存 processed_data 为 CSV 文件
+            processed_output_file_name = f'processed_data_{time_agg_level}.csv'
+            processed_file_path = os.path.join(
+                self.OUTPUT_DIR,
+                time_agg_level.capitalize(),
+                processed_output_file_name
+            )
+            os.makedirs(os.path.dirname(processed_file_path), exist_ok=True)
+            try:
+                processed_data.to_csv(processed_file_path, index=False)
+                logging.info(f"成功保存 processed_data 数据到文件: {processed_file_path}")
+            except Exception as e:
+                logging.error(f"保存 processed_data 数据到 {processed_file_path} 失败: {e}", exc_info=True)
+
+            # 保存 remaining_data 为 CSV 文件
+            remaining_output_file_name = f'remaining_data_{time_agg_level}.csv'
+            remaining_file_path = os.path.join(
+                self.OUTPUT_DIR,
+                time_agg_level.capitalize(),
+                remaining_output_file_name
+            )
+            try:
+                remaining_data.to_csv(remaining_file_path, index=False)
+                logging.info(f"成功保存 remaining_data 数据到文件: {remaining_file_path}")
+            except Exception as e:
+                logging.error(f"保存 remaining_data 数据到 {remaining_file_path} 失败: {e}", exc_info=True)
+
+            # 拼接两部分数据
+            combined_data = pd.concat(
+                [remaining_data, processed_data],
+                ignore_index=True
+            )
+
+            # 去重，避免因拼接导致重复记录
+            combined_data = combined_data.drop_duplicates()
+
+            # 按 Tour ID 和 Date 升序排序
+            combined_data = combined_data.sort_values(by=["Tour ID", "Date"], ascending=[True, True])
+
+            # 保存最终的 Summary stacked 数据
+            output_file_name = f'summary_stacked_{time_agg_level}.csv'
+            original_file_path = os.path.join(
+                self.OUTPUT_DIR,
+                time_agg_level.capitalize(),
+                output_file_name
+            )
+            public_file_path = os.path.join(
+                self.PUBLIC_DIR,
+                output_file_name
+            )
+            try:
+                combined_data.to_csv(original_file_path, index=False)
+                logging.info(f"成功保存最终 Summary stacked 数据到: {original_file_path}")
+            except Exception as e:
+                logging.error(f"保存最终 Summary stacked 数据到 {original_file_path} 失败: {e}", exc_info=True)
+
+            try:
+                combined_data.to_csv(public_file_path, index=False)
+                logging.info(f"成功保存最终 Summary stacked 数据到公共目录: {public_file_path}")
+            except Exception as e:
+                logging.error(f"保存最终 Summary stacked 数据到 {public_file_path} 失败: {e}", exc_info=True)
+
+            return combined_data
+
+        except Exception as e:
+            logging.error(f"合并数据时出错: {e}", exc_info=True)
+            raise
+
+    def plot_reopen_predictions(self, summary_after_process, time_agg_level='weekly'):
+        """
+        步骤6: 绘制重开Tour的预测图表。
+        """
+        try:
+            if self.tours_open_data is None:
+                raise ValueError("需要先读取Tours Open数据。")
+
+            plot_dir = os.path.join(self.OUTPUT_DIR, time_agg_level.capitalize(), 'Reopen_Plots')
+            os.makedirs(plot_dir, exist_ok=True)
+
+            reopen_tour_ids = self.tours_open_data['Tour ID'].tolist()
+
+            for tour_id in reopen_tour_ids:
+                logging.info(f"正在为 Tour ID '{tour_id}' 绘制图表...")
+
+                tour_data = summary_after_process[summary_after_process['Tour ID'] == tour_id].copy()
+
+                if tour_data.empty:
+                    logging.warning(f"未找到 Tour ID '{tour_id}' 的数据，跳过绘图。")
+                    continue
+
+                tour_data['Date'] = pd.to_datetime(tour_data['Date'])
+                tour_data = tour_data.sort_values(by='Date')
+
+                dates = tour_data['Date']
+                pred_values = tour_data['Pred']
+                adj_pred_values = tour_data['Growth_Adj_Pred']
+                actual_values = tour_data['Actual']
+
+                plt.figure(figsize=(12, 6))
+                plt.plot(dates, pred_values, label='Prediction', marker='x', color='blue', linestyle='--')
+                plt.plot(dates, adj_pred_values, label='Growth Adjusted Prediction', marker='^', color='green',
+                         linestyle='-.')
+                plt.plot(dates, actual_values, label='Actual Pax', marker='o', color='black', linestyle='-')
+
+                plt.legend()
+                event_name = self.tour_id_map.get(tour_id, tour_id)
+                plt.title(f"{tour_id} - {event_name} Predictions ({time_agg_level.capitalize()})")
+                plt.xlabel('Date')
+                plt.ylabel('Pax')
+                plt.grid(True)
+
+                date_format = '%Y-%m-%d'
+                plt.gca().xaxis.set_major_formatter(mdates.DateFormatter(date_format))
+                plt.gca().xaxis.set_major_locator(mdates.AutoDateLocator())
+                plt.gcf().autofmt_xdate()
+
+                illegal_chars = r'[\<\>\:"/\\|?*]'
+                safe_tour_id = re.sub(illegal_chars, '_', str(tour_id))
+                safe_event_name = re.sub(illegal_chars, '_', str(event_name))
+
+                filename = f"Reopen Processed_{safe_tour_id}_{safe_event_name}_{time_agg_level}_predictions.png"
+                filepath = os.path.join(plot_dir, filename)
+
+                try:
+                    plt.savefig(filepath)
+                    logging.info(f"成功保存图表: {filepath}")
+                except Exception as e:
+                    logging.error(f"保存图表失败 {filepath}: {e}", exc_info=True)
+
+                plt.close()
+
+        except Exception as e:
+            logging.error(f"绘制图表时出错: {e}", exc_info=True)
+            raise
+
+    def process_tour_reopen(self, time_agg_level='weekly', reference_years=None):
+        """
+        完整的Tour重开处理流程。
+        """
+        if reference_years is None:
+            reference_years = []
+
+        try:
+            logging.info("=========== 开始处理淡季 Tour 重开流程 ===========")
+            logging.info(f"配置: 时间级别='{time_agg_level}', 参考年份={reference_years}")
+
+            # 步骤1: 读取Tours Open数据
+            logging.info("\n--- 步骤 1: 读取 Tours Open 数据 ---")
+            self.read_tours_open_data(time_agg_level)
+
+            # 步骤2: 读取并筛选Summary stacked数据 (在此步骤中计算“孰晚”日期)
+            logging.info("\n--- 步骤 2: 读取并筛选 Summary stacked 数据 (并确定 '孰晚' 开始日期) ---")
+            tours_low_season_before, remaining_data = self.read_and_filter_summary_stacked(time_agg_level)
+
+            # 步骤3: 读取并处理Pax历史数据 (使用“孰晚”日期进行截取)
+            logging.info("\n--- 步骤 3: 读取并处理 Pax 历史数据 (使用 '孰晚' 日期进行截取) ---")
+            pax_historical_after = self.read_and_process_pax_historical(time_agg_level)
+
+            # 步骤4: 处理低季数据 (将历史调整后的预测合并到低季预测中)
+            logging.info("\n--- 步骤 4: 处理低季数据 (将历史数据中的 Growth_Adj_Pred 应用到筛选出的低季数据) ---")
+            tours_low_season_after = self.process_low_season_data(
+                tours_low_season_before, pax_historical_after
+            )
+
+            # 步骤5: 合并回 Summary stacked
+            logging.info("\n--- 步骤 5: 合并回 Summary stacked ---")
+            summary_after_process = self.merge_back_to_summary(
+                processed_data=tours_low_season_after,
+                remaining_data=remaining_data,
+                time_agg_level=time_agg_level
+            )
+
+            # 步骤6: 绘制图表
+            logging.info("\n--- 步骤 6: 绘制图表 ---")
+            self.plot_reopen_predictions(summary_after_process, time_agg_level)
+
+            logging.info("\n=========== 淡季 Tour 重开处理完成！ ===========")
+            return summary_after_process
+
+        except Exception as e:
+            logging.error(f"处理过程中出错: {e}", exc_info=True)
+            raise
+
+
+# 运行示例 (请在运行前确保您的 Outputs 和 Public Data Base 文件夹结构存在，或者已通过其他方式生成数据)
+if __name__ == "__main__":
+    # 配置日志级别以便调试 (可以改为 logging.DEBUG 查看更详细的调试信息)
+    logging.getLogger().setLevel(logging.INFO)
+
+    # 创建处理器实例
+    processor = TourReopenProcessor()
+
+    # 执行完整处理流程
+    # time_agg_level可以是'weekly'或'daily'
+    # reference_years现在是具体年份列表，如[2024, 2023]或[2023]
+    # 请确保您的'Spreadsheets Source'和'Outputs'目录中存在相应的文件
+    try:
+        # 假设我们运行 weekly 流程，参考 2023 年的历史数据
+        result_df = processor.process_tour_reopen(time_agg_level='weekly')
+        print(f"\n最终处理后的 Summary stacked 数据 (周级别) 的前5行:\n{result_df.head()}")
+
+        # 也可以尝试运行 daily 流程
+        # processor_daily = TourReopenProcessor() # 创建新的实例，避免状态混淆
+        # result_daily_df = processor_daily.process_tour_reopen(time_agg_level='daily', reference_years=[2023])
+        # print(f"\n最终处理后的 Summary stacked 数据 (日级别) 的前5行:\n{result_daily_df.head()}")
+
+    except Exception as e:
+        print(f"主程序运行失败: {e}")
+
+    print(
+        "\n请检查 'Outputs' 文件夹中生成的 CSV 文件和图表，以及 'C:\\City Experience\\Public Data Base' 中的 CSV 文件。")
