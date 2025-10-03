@@ -1,0 +1,181 @@
+import pandas as pd
+import numpy as np
+import os
+import pickle
+import logging
+from prophet import Prophet
+from sklearn.metrics import mean_absolute_error
+from model_registry import register_model
+from feature_engineering import FeatureEngineer
+
+@register_model('prophet')
+class ProphetModel:
+    def __init__(self, name, time_level='weekly'): # 默认设置为 'weekly'
+        self.name = name
+        self.model = None
+        self.data = None
+        self.time_level = time_level
+        self.feature_engineer = FeatureEngineer(time_level=time_level)
+        safe_name = str(name).replace('/', '_').replace('\\', '_').replace('?', '').replace('*', '').replace('[', '').replace(']', '')
+        self.model_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models', safe_name.split('_')[0].capitalize())
+        self.model_path = os.path.join(self.model_dir, f"{safe_name}_prophet.pkl")
+        self.feature_path = os.path.join(self.model_dir, f"{safe_name}_prophet_features.pkl")
+        self.absolute_mae = float('inf')
+        self.max_historical_pax = None
+        self.historical_pax_mean = 0
+        self.growth = 'logistic'  # 添加：默认使用logistic增长
+
+    def fit(self, data, mode='full_retrain'):
+        self.data = data
+        date_col = next(col for col in ['Correct Event Time', 'Date', 'WeekStart', 'MonthStart'] if col in data.columns)
+
+        if mode == 'no_train' and os.path.exists(self.model_path):
+            logging.info(f"{self.name} 载入已有模型: {self.model_path}")
+            with open(self.model_path, 'rb') as f:
+                self.model = pickle.load(f)
+            with open(self.feature_path, 'rb') as f:
+                self.feature_engineer.feature_cols = pickle.load(f)
+            return self
+
+        processed_df = self.feature_engineer.preprocess_features(data, date_col, is_training=True)
+        processed_df[date_col] = pd.to_datetime(processed_df[date_col])
+
+        df_prophet = processed_df.rename(columns={date_col: 'ds', 'Actual Pax': 'y'})
+        df_prophet['y'] = pd.to_numeric(df_prophet['y'], errors='coerce').clip(lower=0)
+        df_prophet = df_prophet.dropna(subset=['y'])
+
+        self.historical_pax_mean = df_prophet['y'].mean()
+        self.max_historical_pax = df_prophet['y'].max()
+
+        if len(df_prophet) < 5:
+            logging.warning(f"{self.name} 数据不足（{len(df_prophet)} 行），无法训练")
+            self.model = None
+            self.absolute_mae = float('inf')
+            return self
+
+        # 计算波动率用于自适应scale
+        volatility = df_prophet['y'].std() / self.historical_pax_mean if self.historical_pax_mean > 0 else 1.0
+        changepoint_prior_scale = 0.05 if volatility > 1.5 else 0.1  # 调阈值1.5根据您的测试
+        seasonality_prior_scale = 10.0 if len(df_prophet) > 52 else 5.0  # 假设周数据，>1年用更高scale
+
+        df_prophet['floor'] = 0
+        df_prophet['cap'] = self.max_historical_pax * 2 if self.max_historical_pax else 100  # 防止0 cap
+
+        self.model = Prophet(
+            growth=self.growth,
+            yearly_seasonality=True,
+            weekly_seasonality=True, # 始终开启周季节性
+            daily_seasonality=False, # 不再设置日季节性
+            changepoint_prior_scale=changepoint_prior_scale,
+            seasonality_prior_scale=seasonality_prior_scale,
+            interval_width=0.8  # 启用区间预测
+        )
+
+        for col in self.feature_engineer.get_feature_cols():
+            self.model.add_regressor(col)
+
+        try:
+            self.model.fit(df_prophet[['ds', 'y', 'floor', 'cap'] + self.feature_engineer.get_feature_cols()])
+        except Exception as e:
+            logging.error(f"{self.name} 训练失败: {str(e)}")
+            self.model = None
+            self.absolute_mae = float('inf')
+            return self
+
+        train_size = max(int(len(df_prophet) * 0.8), len(df_prophet) - 5)
+        train_df, test_df = df_prophet[:train_size], df_prophet[train_size:]
+        if not test_df.empty:
+            try:
+                future = test_df[['ds', 'floor', 'cap'] + self.feature_engineer.get_feature_cols()]
+                y_pred = self.model.predict(future)['yhat'].clip(lower=0)
+                self.absolute_mae = mean_absolute_error(test_df['y'], y_pred)
+                logging.info(f"{self.name} MAE: {self.absolute_mae:.2f}")
+            except Exception as e:
+                logging.error(f"MAE 计算失败: {str(e)}")
+                self.absolute_mae = float('inf')
+
+        os.makedirs(self.model_dir, exist_ok=True)
+        with open(self.model_path, 'wb') as f:
+            pickle.dump(self.model, f)
+        with open(self.feature_path, 'wb') as f:
+            pickle.dump(self.feature_engineer.get_feature_cols(), f)
+
+        return self
+
+    def predict(self, start_date, end_date, output_agg_level):
+        freq = {'daily': 'D', 'weekly': 'W-MON', 'monthly': 'MS'}[output_agg_level]
+        dates = pd.date_range(start=start_date, end=end_date, freq=freq)
+
+        if not self.model:
+            logging.warning(f"{self.name} 无模型，返回零预测")
+            return pd.DataFrame({'Dates': dates, 'Predictions': np.zeros(len(dates))})
+
+        date_col = next(col for col in ['Correct Event Time', 'Date', 'WeekStart', 'MonthStart'] if col in self.data.columns)
+
+        try:
+            special_events = pd.read_excel(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Spreadsheets Source', 'Special Event.xlsx'), parse_dates=['Date'])
+            special_events = special_events[(special_events['Date'] >= start_date) & (special_events['Date'] <= end_date)]
+            special_events_agg = special_events.groupby('Date').agg({
+                'Special Event': lambda x: ';'.join(str(i) for i in x if pd.notna(i)),
+                'Special Event City': lambda x: ';'.join(str(i) for i in x if pd.notna(i)),
+                'Event Type': lambda x: ';'.join(str(i) for i in x if pd.notna(i)),
+                'Impact Scale': 'mean'
+            }).reset_index()
+            logging.info(f"预测期间特殊事件数: {len(special_events_agg)}")
+        except FileNotFoundError:
+            special_events_agg = pd.DataFrame({
+                'Date': dates,
+                'Special Event': [''] * len(dates),
+                'Special Event City': [''] * len(dates),
+                'Event Type': [''] * len(dates),
+                'Impact Scale': [1.0] * len(dates)
+            })
+            logging.warning("找不到 Special Event.xlsx，假设无特殊事件")
+
+        future_df = pd.DataFrame({date_col: dates})
+        future_df = future_df.merge(special_events_agg, left_on=date_col, right_on='Date', how='left')
+        future_df.fillna({'Special Event': '', 'Special Event City': '', 'Event Type': '', 'Impact Scale': 1.0}, inplace=True)
+
+        future_df = self.feature_engineer.preprocess_features(future_df, date_col, is_training=False)
+        future_df[date_col] = pd.to_datetime(future_df[date_col])
+
+        for col in self.feature_engineer.get_feature_cols():
+            if col not in future_df.columns:
+                future_df[col] = 0
+
+        future_prophet = future_df.rename(columns={date_col: 'ds'})
+        future_prophet['floor'] = 0  # 添加floor/cap
+        future_prophet['cap'] = self.max_historical_pax * 2 if self.max_historical_pax else 100
+
+        try:
+            forecast = self.model.predict(future_prophet[['ds', 'floor', 'cap'] + self.feature_engineer.get_feature_cols()])
+            predictions = forecast['yhat_lower'].clip(lower=0)  # 用下限区间，更保守
+        except Exception as e:
+            logging.error(f"预测失败: {str(e)}")
+            return pd.DataFrame({'Dates': dates, 'Predictions': np.zeros(len(dates))})
+
+        # Fallback后处理
+        zero_ratio = (predictions == 0).mean()
+        if zero_ratio > 0.5 and self.historical_pax_mean > 0:
+            logging.warning(f"{self.name} 检测到极端零值 ({zero_ratio:.0%})，应用平滑fallback")
+            historical_df = self.data.copy()
+            historical_df[date_col] = pd.to_datetime(historical_df[date_col])
+            last_year_dates = dates - pd.DateOffset(years=1)
+            last_year_pax = pd.DataFrame({'Dates': last_year_dates}).merge(
+                historical_df[[date_col, 'Actual Pax']].rename(columns={date_col: 'Dates', 'Actual Pax': 'LastYearPax'}),
+                on='Dates', how='left'
+            )['LastYearPax'].fillna(0)
+
+            # 平滑增长率：用最近12期的EMA YoY
+            recent_df = df_prophet.tail(12)
+            periods_per_year = 52 if self.time_level == 'weekly' else 12
+            yoy_changes = (recent_df['y'] - recent_df['y'].shift(periods_per_year)) / recent_df['y'].shift(periods_per_year).replace(0, np.nan)
+            yoy_changes = yoy_changes.fillna(0)  # 处理NaN
+            smoothed_growth = yoy_changes.ewm(span=3).mean().mean()  # EMA span=3，可调
+
+            fallback_preds = last_year_pax * (1 + smoothed_growth)
+            fallback_preds = fallback_preds.clip(lower=0.1 * self.historical_pax_mean)  # 最小10%历史均值
+
+            predictions = np.where(predictions == 0, fallback_preds, predictions)
+
+        return pd.DataFrame({'Dates': dates, 'Predictions': predictions})
