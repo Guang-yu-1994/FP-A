@@ -20,8 +20,8 @@ class ProphetModel:
         self.model = None
         self.data = None
         self.time_level = time_level
-        self.auto_tune = auto_tune  # 是否自动调参
-        self.tuning_method = tuning_method  # 'smart_grid' or 'bayesian' or 'time_series_cv'
+        self.auto_tune = auto_tune
+        self.tuning_method = tuning_method
         self.feature_engineer = FeatureEngineer(time_level=time_level)
         safe_name = str(name).replace('/', '_').replace('\\', '_').replace('?', '').replace('*', '').replace('[',
                                                                                                              '').replace(
@@ -38,10 +38,11 @@ class ProphetModel:
         self.recent_trend_ratio = 1.0
         self.ytd_growth_rate = 0.0
         self.historical_seasonality = None
-        self.best_params = None  # 存储最优参数
+        self.best_params = None
+        self.seasonal_volatility = 1.0  # 新增：季节性波动系数
 
     def _calculate_trend_metrics(self, df_prophet):
-        """计算趋势指标"""
+        """计算趋势指标（增强版）"""
         df_sorted = df_prophet.sort_values('ds')
 
         # YTD增长率
@@ -54,12 +55,12 @@ class ProphetModel:
         else:
             self.ytd_growth_rate = 0.0
 
-        # 近期趋势
+        # 近期趋势（使用更稳健的中位数）
         recent_6m = df_sorted.tail(26)
         previous_6m = df_sorted.iloc[-52:-26] if len(df_sorted) >= 52 else df_sorted.iloc[:26]
 
-        recent_mean = recent_6m['y'].mean()
-        previous_mean = previous_6m['y'].mean()
+        recent_mean = recent_6m['y'].median()  # 改为median，更稳健
+        previous_mean = previous_6m['y'].median()
 
         if previous_mean > 0:
             self.recent_trend_ratio = recent_mean / previous_mean
@@ -72,51 +73,65 @@ class ProphetModel:
         else:
             self.historical_seasonality = df_sorted.groupby(df_sorted['ds'].dt.month)['y'].mean()
 
-        logging.info(f"{self.name} - YTD增长: {self.ytd_growth_rate:.2%}, 近期趋势: {self.recent_trend_ratio:.2%}")
+        # 新增：计算季节性波动系数（用于判断淡旺季差异）
+        if len(self.historical_seasonality) > 0:
+            self.seasonal_volatility = (self.historical_seasonality.max() / 
+                                       (self.historical_seasonality.mean() + 1e-10))
+        else:
+            self.seasonal_volatility = 1.0
+
+        logging.info(f"{self.name} - YTD增长: {self.ytd_growth_rate:.2%}, "
+                    f"近期趋势: {self.recent_trend_ratio:.2%}, "
+                    f"季节波动: {self.seasonal_volatility:.2f}x")
 
     def _get_param_search_space(self):
-        """根据数据特征定义智能搜索空间"""
+        """根据数据特征定义智能搜索空间（优化版）"""
         # 基于趋势特征缩小搜索范围
         if self.ytd_growth_rate < -0.3 or self.recent_trend_ratio < 0.7:
-            # 大幅下降：重点搜索保守参数
-            changepoint_range = [0.001, 0.005, 0.01, 0.02]
-            seasonality_range = [8.0, 10.0, 15.0]
-            logging.info(f"{self.name} 大幅下降场景，使用保守参数空间")
+            # 大幅下降：极保守参数
+            changepoint_range = [0.001, 0.005, 0.01]
+            seasonality_range = [10.0, 15.0, 20.0]
+            logging.info(f"{self.name} 大幅下降场景，使用极保守参数空间")
         elif self.ytd_growth_rate < -0.15 or self.recent_trend_ratio < 0.85:
-            # 中度下降：平衡搜索
-            changepoint_range = [0.01, 0.05, 0.1, 0.2]
-            seasonality_range = [3.0, 5.0, 8.0, 10.0]
-            logging.info(f"{self.name} 中度下降场景，使用平衡参数空间")
+            # 中度下降：保守参数
+            changepoint_range = [0.005, 0.01, 0.05]
+            seasonality_range = [5.0, 8.0, 10.0]
+            logging.info(f"{self.name} 中度下降场景，使用保守参数空间")
         elif self.ytd_growth_rate > 0.3 or self.recent_trend_ratio > 1.3:
-            # 大幅增长：允许更激进的趋势捕捉
-            changepoint_range = [0.05, 0.1, 0.3, 0.5]
-            seasonality_range = [1.0, 3.0, 5.0]
-            logging.info(f"{self.name} 大幅增长场景，使用激进参数空间")
+            # 大幅增长：但仍需谨慎，避免过度外推
+            changepoint_range = [0.05, 0.1, 0.2]  # 收窄范围，去掉0.3和0.5
+            seasonality_range = [3.0, 5.0, 8.0]
+            logging.info(f"{self.name} 大幅增长场景，使用适度激进参数空间")
         else:
-            # 正常场景：标准搜索空间
-            changepoint_range = [0.01, 0.05, 0.1, 0.2, 0.5]
-            seasonality_range = [1.0, 3.0, 5.0, 10.0]
+            # 正常场景：标准参数
+            changepoint_range = [0.01, 0.05, 0.1]
+            seasonality_range = [3.0, 5.0, 10.0]
             logging.info(f"{self.name} 正常场景，使用标准参数空间")
+
+        # 季节性模式选择：高波动性倾向multiplicative
+        if self.seasonal_volatility > 3.0:
+            seasonality_modes = ['multiplicative', 'additive']
+        else:
+            seasonality_modes = ['additive', 'multiplicative']
 
         return {
             'changepoint_prior_scale': changepoint_range,
             'seasonality_prior_scale': seasonality_range,
-            'seasonality_mode': ['additive', 'multiplicative']
+            'seasonality_mode': seasonality_modes
         }
 
     def _time_series_cv_score(self, df_prophet, params, n_splits=3):
-        """时间序列交叉验证评分"""
+        """时间序列交叉验证评分（增强版：增加极端预测惩罚）"""
         df_sorted = df_prophet.sort_values('ds').reset_index(drop=True)
         n = len(df_sorted)
 
-        if n < 20:  # 数据太少，只做单次验证
+        if n < 20:
             n_splits = 1
 
         scores = []
-        min_train_size = max(int(n * 0.6), 10)  # 至少60%或10条数据用于训练
+        min_train_size = max(int(n * 0.6), 10)
 
         for i in range(n_splits):
-            # 逐步增加训练集大小
             if n_splits == 1:
                 train_size = max(int(n * 0.8), n - 5)
             else:
@@ -129,7 +144,6 @@ class ProphetModel:
                 continue
 
             try:
-                # 训练模型
                 model = Prophet(
                     yearly_seasonality=True,
                     weekly_seasonality=True,
@@ -145,62 +159,102 @@ class ProphetModel:
 
                 model.fit(train[['ds', 'y'] + self.feature_engineer.get_feature_cols()])
 
-                # 预测
                 future = test[['ds'] + self.feature_engineer.get_feature_cols()]
                 forecast = model.predict(future)
                 y_pred = forecast['yhat'].clip(lower=0)
 
-                # 计算综合评分（MAE + MAPE，避免过度惩罚小值）
+                # 基础误差指标
                 mae = mean_absolute_error(test['y'], y_pred)
-                # MAPE对小值敏感，添加epsilon避免除零
                 mape = np.mean(np.abs((test['y'] - y_pred) / (test['y'] + 1e-10))) * 100
 
-                # 检查预测是否合理（不全为0，不过度偏离历史均值）
+                # === 新增：极端预测惩罚机制 ===
+                penalty = 0
+                
+                # 惩罚1：预测值全为0
+                if y_pred.sum() == 0:
+                    penalty += 10000
+                
+                # 惩罚2：预测均值过度偏离真实均值
                 mean_pred = y_pred.mean()
                 mean_true = test['y'].mean()
-                if mean_pred == 0 or (mean_true > 0 and mean_pred / mean_true > 3):
-                    # 惩罚极端预测
-                    penalty = 1000
-                else:
-                    penalty = 0
+                if mean_true > 0:
+                    pred_ratio = mean_pred / mean_true
+                    if pred_ratio > 3.0 or pred_ratio < 0.2:  # 预测偏离3倍以上
+                        penalty += 500 * abs(np.log(pred_ratio))
+                
+                # 惩罚3：淡季极端高预测（针对问题3）
+                for j in range(len(test)):
+                    test_val = test.iloc[j]['y']
+                    pred_val = y_pred.iloc[j]
+                    
+                    # 如果历史值很小但预测很大
+                    if test_val < self.historical_pax_mean * 0.2 and pred_val > test_val * 5:
+                        penalty += 200 * (pred_val / (test_val + 1))
+                    
+                    # 如果预测值超过历史最大值的2倍（防止离谱预测）
+                    if pred_val > self.max_historical_pax * 2.0:
+                        penalty += 300
 
-                # 综合得分：MAE权重0.7，MAPE权重0.3
+                # 综合得分
                 score = 0.7 * mae + 0.3 * mape + penalty
                 scores.append(score)
 
             except Exception as e:
                 logging.warning(f"CV评分失败: {str(e)}")
-                scores.append(1e6)  # 失败时给极大惩罚
+                scores.append(1e6)
 
         return np.mean(scores) if scores else 1e6
 
     def _smart_grid_search(self, df_prophet):
-        """智能网格搜索：基于数据特征的自适应搜索"""
+        """智能网格搜索（修复版：完整实现）"""
         param_space = self._get_param_search_space()
 
         best_score = float('inf')
         best_params = None
 
-        # ... (existing for loop for parameter search)
-        # for cp, sp, sm in param_combinations:
-        #     ...
+        # === 修复：实现完整的参数搜索循环 ===
+        param_combinations = list(product(
+            param_space['changepoint_prior_scale'],
+            param_space['seasonality_prior_scale'],
+            param_space['seasonality_mode']
+        ))
 
-        logging.info(f"{self.name} 最优参数: {best_params}, 得分: {best_score:.2f}")
+        logging.info(f"{self.name} 开始网格搜索，共 {len(param_combinations)} 种参数组合")
 
-        # --- START: RECOMMENDED ADDITION ---
+        for cp, sp, sm in param_combinations:
+            params = {
+                'changepoint_prior_scale': cp,
+                'seasonality_prior_scale': sp,
+                'seasonality_mode': sm
+            }
+            
+            try:
+                score = self._time_series_cv_score(df_prophet, params)
+                
+                if score < best_score:
+                    best_score = score
+                    best_params = params
+                    logging.info(f"  新最优参数: cp={cp}, sp={sp}, mode={sm}, score={score:.2f}")
+            
+            except Exception as e:
+                logging.warning(f"  参数组合失败 cp={cp}, sp={sp}: {str(e)}")
+                continue
+
+        # Fallback机制
         if best_params is None:
-            logging.warning(f"{self.name} - Hyperparameter search failed. Falling back to default parameters.")
+            logging.warning(f"{self.name} - 超参数搜索失败，使用保守默认参数")
             best_params = {
-                'changepoint_prior_scale': 0.05,
-                'seasonality_prior_scale': 5.0,
+                'changepoint_prior_scale': 0.01,  # 更保守的默认值
+                'seasonality_prior_scale': 10.0,
                 'seasonality_mode': 'additive'
             }
-        # --- END: RECOMMENDED ADDITION ---
+        else:
+            logging.info(f"{self.name} 最优参数: {best_params}, 得分: {best_score:.2f}")
 
         return best_params
 
     def _bayesian_optimization(self, df_prophet, n_iterations=15):
-        """贝叶斯优化（可选，适合更大的搜索空间）"""
+        """贝叶斯优化（优化版）"""
         try:
             from skopt import gp_minimize
             from skopt.space import Real, Categorical
@@ -210,7 +264,6 @@ class ProphetModel:
 
         param_space = self._get_param_search_space()
 
-        # 定义搜索空间（对数尺度）
         search_space = [
             Real(np.log10(min(param_space['changepoint_prior_scale'])),
                  np.log10(max(param_space['changepoint_prior_scale'])),
@@ -249,8 +302,7 @@ class ProphetModel:
         elif self.tuning_method == 'smart_grid':
             return self._smart_grid_search(df_prophet)
         elif self.tuning_method == 'time_series_cv':
-            # 使用Prophet内置的交叉验证（较慢但更准确）
-            return self._smart_grid_search(df_prophet)  # 简化实现
+            return self._smart_grid_search(df_prophet)
         else:
             return self._smart_grid_search(df_prophet)
 
@@ -271,6 +323,7 @@ class ProphetModel:
                 self.historical_seasonality = metadata['historical_seasonality']
                 self.historical_pax_mean = metadata['historical_pax_mean']
                 self.max_historical_pax = metadata['max_historical_pax']
+                self.seasonal_volatility = metadata.get('seasonal_volatility', 1.0)
             if os.path.exists(self.best_params_path):
                 with open(self.best_params_path, 'rb') as f:
                     self.best_params = pickle.load(f)
@@ -292,14 +345,13 @@ class ProphetModel:
             self.absolute_mae = float('inf')
             return self
 
-        # 计算趋势指标
+        # 计算趋势指标（包括新增的seasonal_volatility）
         self._calculate_trend_metrics(df_prophet)
 
         # 自动调参
         if self.auto_tune:
             self.best_params = self._find_best_params(df_prophet)
         else:
-            # 使用默认参数或已保存的参数
             if os.path.exists(self.best_params_path):
                 with open(self.best_params_path, 'rb') as f:
                     self.best_params = pickle.load(f)
@@ -357,7 +409,8 @@ class ProphetModel:
                 'recent_trend_ratio': self.recent_trend_ratio,
                 'historical_seasonality': self.historical_seasonality,
                 'historical_pax_mean': self.historical_pax_mean,
-                'max_historical_pax': self.max_historical_pax
+                'max_historical_pax': self.max_historical_pax,
+                'seasonal_volatility': self.seasonal_volatility
             }, f)
         with open(self.best_params_path, 'wb') as f:
             pickle.dump(self.best_params, f)
@@ -365,7 +418,7 @@ class ProphetModel:
         return self
 
     def _apply_intelligent_floor(self, predictions, dates):
-        """智能下界保护"""
+        """智能下界保护（增强版）"""
         last_year_data = self.data.copy()
         date_col = next(
             col for col in ['Correct Event Time', 'Date', 'WeekStart', 'MonthStart'] if col in last_year_data.columns)
@@ -386,10 +439,13 @@ class ProphetModel:
 
             last_year_value = last_year_data[mask]['Actual Pax'].mean() if mask.any() else self.historical_pax_mean
 
-            # 触发条件：预测 < 去年同期20% 且去年同期有值
+            # === 增强：针对淡季极端预测的保护（问题3） ===
+            is_low_season = last_year_value < self.historical_pax_mean * 0.3
+            
+            # 触发条件1：预测远低于去年同期
             if raw_pred < last_year_value * 0.2 and last_year_value > 0:
                 smoothed_growth = 0.6 * self.ytd_growth_rate + 0.4 * (self.recent_trend_ratio - 1)
-                smoothed_growth = max(smoothed_growth, -0.4)  # 最多下降40%
+                smoothed_growth = max(smoothed_growth, -0.4)
 
                 if self.historical_seasonality is not None:
                     if self.time_level == 'weekly':
@@ -406,6 +462,20 @@ class ProphetModel:
 
                 logging.debug(f"{self.name} {pred_date.date()}: 原始={raw_pred:.1f}, 调整后={adjusted_pred:.1f}")
                 adjusted_predictions.append(adjusted_pred)
+            
+            # 触发条件2：淡季预测过高（新增）
+            elif is_low_season and raw_pred > last_year_value * 3.0:
+                # 淡季预测不应超过去年同期的2倍
+                capped_pred = min(raw_pred, last_year_value * 2.0)
+                logging.debug(f"{self.name} {pred_date.date()} 淡季封顶: 原始={raw_pred:.1f}, 调整后={capped_pred:.1f}")
+                adjusted_predictions.append(capped_pred)
+            
+            # 触发条件3：预测超过历史最大值的1.5倍（新增）
+            elif raw_pred > self.max_historical_pax * 1.5:
+                capped_pred = self.max_historical_pax * 1.5
+                logging.debug(f"{self.name} {pred_date.date()} 超历史最大: 原始={raw_pred:.1f}, 调整后={capped_pred:.1f}")
+                adjusted_predictions.append(capped_pred)
+            
             else:
                 adjusted_predictions.append(raw_pred)
 
