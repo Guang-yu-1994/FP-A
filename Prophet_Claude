@@ -9,7 +9,9 @@ from model_registry import register_model
 from feature_engineering import FeatureEngineer
 from itertools import product
 import warnings
+
 warnings.filterwarnings('ignore')
+
 
 @register_model('prophet')
 class ProphetModel:
@@ -21,8 +23,11 @@ class ProphetModel:
         self.auto_tune = auto_tune  # 是否自动调参
         self.tuning_method = tuning_method  # 'smart_grid' or 'bayesian' or 'time_series_cv'
         self.feature_engineer = FeatureEngineer(time_level=time_level)
-        safe_name = str(name).replace('/', '_').replace('\\', '_').replace('?', '').replace('*', '').replace('[', '').replace(']', '')
-        self.model_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models', safe_name.split('_')[0].capitalize())
+        safe_name = str(name).replace('/', '_').replace('\\', '_').replace('?', '').replace('*', '').replace('[',
+                                                                                                             '').replace(
+            ']', '')
+        self.model_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models',
+                                      safe_name.split('_')[0].capitalize())
         self.model_path = os.path.join(self.model_dir, f"{safe_name}_prophet.pkl")
         self.feature_path = os.path.join(self.model_dir, f"{safe_name}_prophet_features.pkl")
         self.metadata_path = os.path.join(self.model_dir, f"{safe_name}_prophet_metadata.pkl")
@@ -38,35 +43,35 @@ class ProphetModel:
     def _calculate_trend_metrics(self, df_prophet):
         """计算趋势指标"""
         df_sorted = df_prophet.sort_values('ds')
-        
+
         # YTD增长率
         current_year = df_sorted['ds'].max().year
         ytd_current = df_sorted[df_sorted['ds'].dt.year == current_year]['y'].sum()
         ytd_previous = df_sorted[df_sorted['ds'].dt.year == current_year - 1]['y'].sum()
-        
+
         if ytd_previous > 0:
             self.ytd_growth_rate = (ytd_current - ytd_previous) / ytd_previous
         else:
             self.ytd_growth_rate = 0.0
-        
+
         # 近期趋势
         recent_6m = df_sorted.tail(26)
         previous_6m = df_sorted.iloc[-52:-26] if len(df_sorted) >= 52 else df_sorted.iloc[:26]
-        
+
         recent_mean = recent_6m['y'].mean()
         previous_mean = previous_6m['y'].mean()
-        
+
         if previous_mean > 0:
             self.recent_trend_ratio = recent_mean / previous_mean
         else:
             self.recent_trend_ratio = 1.0
-        
+
         # 历史季节性
         if self.time_level == 'weekly':
             self.historical_seasonality = df_sorted.groupby(df_sorted['ds'].dt.isocalendar().week)['y'].mean()
         else:
             self.historical_seasonality = df_sorted.groupby(df_sorted['ds'].dt.month)['y'].mean()
-        
+
         logging.info(f"{self.name} - YTD增长: {self.ytd_growth_rate:.2%}, 近期趋势: {self.recent_trend_ratio:.2%}")
 
     def _get_param_search_space(self):
@@ -92,7 +97,7 @@ class ProphetModel:
             changepoint_range = [0.01, 0.05, 0.1, 0.2, 0.5]
             seasonality_range = [1.0, 3.0, 5.0, 10.0]
             logging.info(f"{self.name} 正常场景，使用标准参数空间")
-        
+
         return {
             'changepoint_prior_scale': changepoint_range,
             'seasonality_prior_scale': seasonality_range,
@@ -103,26 +108,26 @@ class ProphetModel:
         """时间序列交叉验证评分"""
         df_sorted = df_prophet.sort_values('ds').reset_index(drop=True)
         n = len(df_sorted)
-        
+
         if n < 20:  # 数据太少，只做单次验证
             n_splits = 1
-        
+
         scores = []
         min_train_size = max(int(n * 0.6), 10)  # 至少60%或10条数据用于训练
-        
+
         for i in range(n_splits):
             # 逐步增加训练集大小
             if n_splits == 1:
                 train_size = max(int(n * 0.8), n - 5)
             else:
                 train_size = min_train_size + int((n - min_train_size) * (i + 1) / (n_splits + 1))
-            
+
             train = df_sorted.iloc[:train_size]
             test = df_sorted.iloc[train_size:train_size + min(5, n - train_size)]
-            
+
             if len(test) == 0:
                 continue
-            
+
             try:
                 # 训练模型
                 model = Prophet(
@@ -134,22 +139,22 @@ class ProphetModel:
                     seasonality_mode=params['seasonality_mode'],
                     growth='linear'
                 )
-                
+
                 for col in self.feature_engineer.get_feature_cols():
                     model.add_regressor(col)
-                
+
                 model.fit(train[['ds', 'y'] + self.feature_engineer.get_feature_cols()])
-                
+
                 # 预测
                 future = test[['ds'] + self.feature_engineer.get_feature_cols()]
                 forecast = model.predict(future)
                 y_pred = forecast['yhat'].clip(lower=0)
-                
+
                 # 计算综合评分（MAE + MAPE，避免过度惩罚小值）
                 mae = mean_absolute_error(test['y'], y_pred)
                 # MAPE对小值敏感，添加epsilon避免除零
                 mape = np.mean(np.abs((test['y'] - y_pred) / (test['y'] + 1e-10))) * 100
-                
+
                 # 检查预测是否合理（不全为0，不过度偏离历史均值）
                 mean_pred = y_pred.mean()
                 mean_true = test['y'].mean()
@@ -158,49 +163,40 @@ class ProphetModel:
                     penalty = 1000
                 else:
                     penalty = 0
-                
+
                 # 综合得分：MAE权重0.7，MAPE权重0.3
                 score = 0.7 * mae + 0.3 * mape + penalty
                 scores.append(score)
-                
+
             except Exception as e:
                 logging.warning(f"CV评分失败: {str(e)}")
                 scores.append(1e6)  # 失败时给极大惩罚
-        
+
         return np.mean(scores) if scores else 1e6
 
     def _smart_grid_search(self, df_prophet):
         """智能网格搜索：基于数据特征的自适应搜索"""
         param_space = self._get_param_search_space()
-        
+
         best_score = float('inf')
         best_params = None
-        
-        # 生成参数组合
-        param_combinations = list(product(
-            param_space['changepoint_prior_scale'],
-            param_space['seasonality_prior_scale'],
-            param_space['seasonality_mode']
-        ))
-        
-        logging.info(f"{self.name} 开始网格搜索，共 {len(param_combinations)} 组参数")
-        
-        for cp, sp, sm in param_combinations:
-            params = {
-                'changepoint_prior_scale': cp,
-                'seasonality_prior_scale': sp,
-                'seasonality_mode': sm
-            }
-            
-            score = self._time_series_cv_score(df_prophet, params)
-            
-            logging.debug(f"参数 {params} -> 得分: {score:.2f}")
-            
-            if score < best_score:
-                best_score = score
-                best_params = params
-        
+
+        # ... (existing for loop for parameter search)
+        # for cp, sp, sm in param_combinations:
+        #     ...
+
         logging.info(f"{self.name} 最优参数: {best_params}, 得分: {best_score:.2f}")
+
+        # --- START: RECOMMENDED ADDITION ---
+        if best_params is None:
+            logging.warning(f"{self.name} - Hyperparameter search failed. Falling back to default parameters.")
+            best_params = {
+                'changepoint_prior_scale': 0.05,
+                'seasonality_prior_scale': 5.0,
+                'seasonality_mode': 'additive'
+            }
+        # --- END: RECOMMENDED ADDITION ---
+
         return best_params
 
     def _bayesian_optimization(self, df_prophet, n_iterations=15):
@@ -211,20 +207,20 @@ class ProphetModel:
         except ImportError:
             logging.warning("未安装scikit-optimize，回退到网格搜索")
             return self._smart_grid_search(df_prophet)
-        
+
         param_space = self._get_param_search_space()
-        
+
         # 定义搜索空间（对数尺度）
         search_space = [
-            Real(np.log10(min(param_space['changepoint_prior_scale'])), 
-                 np.log10(max(param_space['changepoint_prior_scale'])), 
+            Real(np.log10(min(param_space['changepoint_prior_scale'])),
+                 np.log10(max(param_space['changepoint_prior_scale'])),
                  name='changepoint_prior_scale', prior='log-uniform'),
-            Real(np.log10(min(param_space['seasonality_prior_scale'])), 
-                 np.log10(max(param_space['seasonality_prior_scale'])), 
+            Real(np.log10(min(param_space['seasonality_prior_scale'])),
+                 np.log10(max(param_space['seasonality_prior_scale'])),
                  name='seasonality_prior_scale', prior='log-uniform'),
             Categorical(param_space['seasonality_mode'], name='seasonality_mode')
         ]
-        
+
         def objective(params_list):
             params = {
                 'changepoint_prior_scale': 10 ** params_list[0],
@@ -232,17 +228,17 @@ class ProphetModel:
                 'seasonality_mode': params_list[2]
             }
             return self._time_series_cv_score(df_prophet, params)
-        
+
         logging.info(f"{self.name} 开始贝叶斯优化，{n_iterations} 次迭代")
-        
+
         result = gp_minimize(objective, search_space, n_calls=n_iterations, random_state=42, verbose=False)
-        
+
         best_params = {
             'changepoint_prior_scale': 10 ** result.x[0],
             'seasonality_prior_scale': 10 ** result.x[1],
             'seasonality_mode': result.x[2]
         }
-        
+
         logging.info(f"{self.name} 最优参数: {best_params}, 得分: {result.fun:.2f}")
         return best_params
 
@@ -298,7 +294,7 @@ class ProphetModel:
 
         # 计算趋势指标
         self._calculate_trend_metrics(df_prophet)
-        
+
         # 自动调参
         if self.auto_tune:
             self.best_params = self._find_best_params(df_prophet)
@@ -371,13 +367,14 @@ class ProphetModel:
     def _apply_intelligent_floor(self, predictions, dates):
         """智能下界保护"""
         last_year_data = self.data.copy()
-        date_col = next(col for col in ['Correct Event Time', 'Date', 'WeekStart', 'MonthStart'] if col in last_year_data.columns)
+        date_col = next(
+            col for col in ['Correct Event Time', 'Date', 'WeekStart', 'MonthStart'] if col in last_year_data.columns)
         last_year_data[date_col] = pd.to_datetime(last_year_data[date_col])
-        
+
         adjusted_predictions = []
         for i, pred_date in enumerate(dates):
             raw_pred = predictions.iloc[i]
-            
+
             if self.time_level == 'weekly':
                 last_year_date = pred_date - pd.DateOffset(years=1)
                 mask = (last_year_data[date_col] >= last_year_date - pd.Timedelta(days=7)) & \
@@ -386,14 +383,14 @@ class ProphetModel:
                 last_year_date = pred_date - pd.DateOffset(years=1)
                 mask = (last_year_data[date_col].dt.month == last_year_date.month) & \
                        (last_year_data[date_col].dt.year == last_year_date.year)
-            
+
             last_year_value = last_year_data[mask]['Actual Pax'].mean() if mask.any() else self.historical_pax_mean
-            
+
             # 触发条件：预测 < 去年同期20% 且去年同期有值
             if raw_pred < last_year_value * 0.2 and last_year_value > 0:
                 smoothed_growth = 0.6 * self.ytd_growth_rate + 0.4 * (self.recent_trend_ratio - 1)
                 smoothed_growth = max(smoothed_growth, -0.4)  # 最多下降40%
-                
+
                 if self.historical_seasonality is not None:
                     if self.time_level == 'weekly':
                         week_num = pred_date.isocalendar()[1]
@@ -403,15 +400,15 @@ class ProphetModel:
                         seasonal_factor = self.historical_seasonality.get(month_num, 1.0) / self.historical_pax_mean
                 else:
                     seasonal_factor = 1.0
-                
+
                 baseline = last_year_value * (1 + smoothed_growth) * seasonal_factor
                 adjusted_pred = min(max(raw_pred, baseline), last_year_value * 1.2)
-                
+
                 logging.debug(f"{self.name} {pred_date.date()}: 原始={raw_pred:.1f}, 调整后={adjusted_pred:.1f}")
                 adjusted_predictions.append(adjusted_pred)
             else:
                 adjusted_predictions.append(raw_pred)
-        
+
         return pd.Series(adjusted_predictions)
 
     def predict(self, start_date, end_date, output_agg_level):
@@ -422,11 +419,15 @@ class ProphetModel:
             logging.warning(f"{self.name} 无模型")
             return pd.DataFrame({'Dates': dates, 'Predictions': np.zeros(len(dates))})
 
-        date_col = next(col for col in ['Correct Event Time', 'Date', 'WeekStart', 'MonthStart'] if col in self.data.columns)
+        date_col = next(
+            col for col in ['Correct Event Time', 'Date', 'WeekStart', 'MonthStart'] if col in self.data.columns)
 
         try:
-            special_events = pd.read_excel(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Spreadsheets Source', 'Special Event.xlsx'), parse_dates=['Date'])
-            special_events = special_events[(special_events['Date'] >= start_date) & (special_events['Date'] <= end_date)]
+            special_events = pd.read_excel(
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Spreadsheets Source', 'Special Event.xlsx'),
+                parse_dates=['Date'])
+            special_events = special_events[
+                (special_events['Date'] >= start_date) & (special_events['Date'] <= end_date)]
             special_events_agg = special_events.groupby('Date').agg({
                 'Special Event': lambda x: ';'.join(str(i) for i in x if pd.notna(i)),
                 'Special Event City': lambda x: ';'.join(str(i) for i in x if pd.notna(i)),
@@ -444,7 +445,8 @@ class ProphetModel:
 
         future_df = pd.DataFrame({date_col: dates})
         future_df = future_df.merge(special_events_agg, left_on=date_col, right_on='Date', how='left')
-        future_df.fillna({'Special Event': '', 'Special Event City': '', 'Event Type': '', 'Impact Scale': 1.0}, inplace=True)
+        future_df.fillna({'Special Event': '', 'Special Event City': '', 'Event Type': '', 'Impact Scale': 1.0},
+                         inplace=True)
 
         future_df = self.feature_engineer.preprocess_features(future_df, date_col, is_training=False)
         future_df[date_col] = pd.to_datetime(future_df[date_col])
