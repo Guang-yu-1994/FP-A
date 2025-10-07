@@ -1,5 +1,5 @@
 def predict(self, start_date, end_date, output_agg_level):
-    """预测方法（修复版：在最后强制加上限）"""
+    """预测方法（修复版：在最后强制加上限 + 详细日志）"""
     freq = {'daily': 'D', 'weekly': 'W-MON', 'monthly': 'MS'}[output_agg_level]
     dates = pd.date_range(start=start_date, end=end_date, freq=freq)
 
@@ -52,17 +52,29 @@ def predict(self, start_date, end_date, output_agg_level):
     try:
         forecast = self.model.predict(future_prophet[['ds'] + self.feature_engineer.get_feature_cols()])
         raw_predictions = forecast['yhat'].clip(lower=0)
+        
+        logging.info(f"\n{'='*80}")
+        logging.info(f"{self.name} - 开始预测处理")
+        logging.info(f"预测时间范围: {start_date.date()} 到 {end_date.date()}")
+        logging.info(f"历史数据统计: 均值={self.historical_pax_mean:.1f}, 最大值={self.max_historical_pax:.1f}")
+        logging.info(f"{'='*80}\n")
+        
         adjusted_predictions = self._apply_intelligent_floor(raw_predictions, dates)
         final_predictions = adjusted_predictions.clip(lower=0)
     except Exception as e:
         logging.error(f"预测失败: {str(e)}")
         return pd.DataFrame({'Dates': dates, 'Predictions': np.zeros(len(dates))})
 
-    # ========== 新增：最后一道防线，强制上限 ==========
+    # ========== 新增：最后一道防线，强制上限（带详细日志）==========
+    logging.info(f"\n{'-'*80}")
+    logging.info(f"{self.name} - 开始最终上限检查")
+    logging.info(f"{'-'*80}")
+    
     last_year_data = self.data.copy()
     last_year_data[date_col] = pd.to_datetime(last_year_data[date_col])
     
     hard_capped_predictions = []
+    problem_count = 0  # 统计有多少个预测被修正
     
     for i, pred_date in enumerate(dates):
         pred_value = final_predictions.iloc[i]
@@ -73,31 +85,86 @@ def predict(self, start_date, end_date, output_agg_level):
         last_year_mask = (last_year_data[date_col].dt.month == target_month) & \
                          (last_year_data[date_col].dt.year == target_year - 1)
         
+        found_year = target_year - 1
         if not last_year_mask.any():
             last_year_mask = (last_year_data[date_col].dt.month == target_month) & \
                              (last_year_data[date_col].dt.year == target_year - 2)
+            found_year = target_year - 2
         
         if not last_year_mask.any():
             last_year_mask = (last_year_data[date_col].dt.month == target_month)
+            found_year = "历史所有年份"
         
         if last_year_mask.any():
             last_year_avg = last_year_data[last_year_mask]['Actual Pax'].mean()
+            last_year_max = last_year_data[last_year_mask]['Actual Pax'].max()
+            data_count = last_year_mask.sum()
         else:
-            last_year_avg = self.historical_pax_mean
+            # 如果找不到去年数据，用历史同月均值（而不是全局均值）
+            all_same_month_mask = (last_year_data[date_col].dt.month == target_month)
+            if all_same_month_mask.any():
+                last_year_avg = last_year_data[all_same_month_mask]['Actual Pax'].mean()
+                last_year_max = last_year_data[all_same_month_mask]['Actual Pax'].max()
+                data_count = all_same_month_mask.sum()
+                found_year = "历史所有年份"
+            else:
+                # 彻底找不到，用保守值
+                last_year_avg = 0.0
+                last_year_max = 0.0
+                data_count = 0
+                found_year = "未找到(使用零值)"
         
-        # 如果去年同期接近0，强制为0
-        if last_year_avg <= 10:
+        # 判断是否淡季
+        is_low_season = target_month in [1, 2, 3, 10, 11, 12]
+        season_label = "淡季" if is_low_season else "旺季"
+        
+        # 应用规则
+        original_value = pred_value
+        rule_applied = "无修正"
+        
+        # 规则1: 如果去年同期接近0，强制为0
+        if last_year_avg <= 10:  # 改回用均值判断
             capped_value = 0.0
-        # 淡季：上限=去年同期2倍
-        elif target_month in [1, 2, 3, 10, 11, 12]:
-            capped_value = min(pred_value, last_year_avg * 2.0)
-        # 旺季：上限=历史最大值1.5倍
+            rule_applied = f"规则1-零值规则(去年均值={last_year_avg:.1f}<=10)"
+        # 规则2: 淡季：上限=去年同月均值的2倍
+        elif is_low_season:
+            max_allowed = last_year_avg * 2.0  # 改回用均值
+            if pred_value > max_allowed:
+                capped_value = max_allowed
+                rule_applied = f"规则2-淡季封顶(去年均值={last_year_avg:.1f}, 上限={max_allowed:.1f})"
+            else:
+                capped_value = pred_value
+        # 规则3: 旺季：上限=去年同月均值的3倍（或历史最大值1.5倍，取较大者）
         else:
-            capped_value = min(pred_value, self.max_historical_pax * 1.5)
+            max_allowed_by_last_year = last_year_avg * 3.0
+            max_allowed_by_history = self.max_historical_pax * 1.5
+            max_allowed = max(max_allowed_by_last_year, max_allowed_by_history)
+            if pred_value > max_allowed:
+                capped_value = max_allowed
+                rule_applied = f"规则3-旺季封顶(去年均值={last_year_avg:.1f}, 上限={max_allowed:.1f})"
+            else:
+                capped_value = pred_value
         
         hard_capped_predictions.append(capped_value)
+        
+        # 详细日志：只输出被修正的或淡季的预测
+        if original_value != capped_value or is_low_season:
+            problem_count += 1
+            logging.info(
+                f"[{pred_date.date()}] {season_label}({target_month}月) | "
+                f"参考数据: {found_year}年{target_month}月(均值={last_year_avg:.1f}, 最大={last_year_max:.1f}, 数据点={data_count}) | "
+                f"原始预测={original_value:.1f} → 最终预测={capped_value:.1f} | "
+                f"{rule_applied}"
+            )
     
     # 用强制上限后的结果替换
     final_predictions = pd.Series(hard_capped_predictions).clip(lower=0)
+    
+    logging.info(f"\n{'-'*80}")
+    logging.info(f"{self.name} - 上限检查完成，共修正 {problem_count} 个预测值")
+    logging.info(f"最终预测统计: 最小值={final_predictions.min():.1f}, "
+                 f"最大值={final_predictions.max():.1f}, "
+                 f"均值={final_predictions.mean():.1f}")
+    logging.info(f"{'-'*80}\n")
     
     return pd.DataFrame({'Dates': dates, 'Predictions': final_predictions})
