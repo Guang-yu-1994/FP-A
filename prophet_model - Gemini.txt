@@ -1,79 +1,103 @@
-def _apply_intelligent_floor(self, predictions, dates):
-    """智能下界保护（简化版：只做一件事 - 限制淡季预测上限）"""
-    last_year_data = self.data.copy()
+def predict(self, start_date, end_date, output_agg_level):
+    """预测方法（修复版：在最后强制加上限）"""
+    freq = {'daily': 'D', 'weekly': 'W-MON', 'monthly': 'MS'}[output_agg_level]
+    dates = pd.date_range(start=start_date, end=end_date, freq=freq)
+
+    if not self.model:
+        logging.warning(f"{self.name} 无模型")
+        return pd.DataFrame({'Dates': dates, 'Predictions': np.zeros(len(dates))})
+
     date_col = next(
         col for col in ['Correct Event Time', 'Date', 'WeekStart', 'MonthStart'] 
-        if col in last_year_data.columns
+        if col in self.data.columns
     )
-    last_year_data[date_col] = pd.to_datetime(last_year_data[date_col])
 
-    adjusted_predictions = []
+    # 读取特殊事件（保持原有逻辑）
+    try:
+        special_events = pd.read_excel(
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Spreadsheets Source', 'Special Event.xlsx'),
+            parse_dates=['Date'])
+        special_events = special_events[
+            (special_events['Date'] >= start_date) & (special_events['Date'] <= end_date)]
+        special_events_agg = special_events.groupby('Date').agg({
+            'Special Event': lambda x: ';'.join(str(i) for i in x if pd.notna(i)),
+            'Special Event City': lambda x: ';'.join(str(i) for i in x if pd.notna(i)),
+            'Event Type': lambda x: ';'.join(str(i) for i in x if pd.notna(i)),
+            'Impact Scale': 'mean'
+        }).reset_index()
+    except FileNotFoundError:
+        special_events_agg = pd.DataFrame({
+            'Date': dates,
+            'Special Event': [''] * len(dates),
+            'Special Event City': [''] * len(dates),
+            'Event Type': [''] * len(dates),
+            'Impact Scale': [1.0] * len(dates)
+        })
+
+    # 准备未来数据（保持原有逻辑）
+    future_df = pd.DataFrame({date_col: dates})
+    future_df = future_df.merge(special_events_agg, left_on=date_col, right_on='Date', how='left')
+    future_df.fillna({'Special Event': '', 'Special Event City': '', 'Event Type': '', 'Impact Scale': 1.0},
+                     inplace=True)
+
+    future_df = self.feature_engineer.preprocess_features(future_df, date_col, is_training=False)
+    future_df[date_col] = pd.to_datetime(future_df[date_col])
+
+    for col in self.feature_engineer.get_feature_cols():
+        if col not in future_df.columns:
+            future_df[col] = 0
+
+    future_prophet = future_df.rename(columns={date_col: 'ds'})
+    
+    try:
+        forecast = self.model.predict(future_prophet[['ds'] + self.feature_engineer.get_feature_cols()])
+        raw_predictions = forecast['yhat'].clip(lower=0)
+        adjusted_predictions = self._apply_intelligent_floor(raw_predictions, dates)
+        final_predictions = adjusted_predictions.clip(lower=0)
+    except Exception as e:
+        logging.error(f"预测失败: {str(e)}")
+        return pd.DataFrame({'Dates': dates, 'Predictions': np.zeros(len(dates))})
+
+    # ========== 新增：最后一道防线，强制上限 ==========
+    last_year_data = self.data.copy()
+    last_year_data[date_col] = pd.to_datetime(last_year_data[date_col])
+    
+    hard_capped_predictions = []
     
     for i, pred_date in enumerate(dates):
-        raw_pred = predictions.iloc[i]
-
-        # ========== 简单粗暴：用月份匹配去年同期 ==========
-        # 找去年同月份的所有数据（不管day/week）
+        pred_value = final_predictions.iloc[i]
         target_month = pred_date.month
         target_year = pred_date.year
         
-        # 查找去年同月
+        # 找去年同月的平均值
         last_year_mask = (last_year_data[date_col].dt.month == target_month) & \
                          (last_year_data[date_col].dt.year == target_year - 1)
         
-        # 如果没找到去年的，找前年的
         if not last_year_mask.any():
             last_year_mask = (last_year_data[date_col].dt.month == target_month) & \
                              (last_year_data[date_col].dt.year == target_year - 2)
         
-        # 如果还是没找到，用历史同月的平均值
         if not last_year_mask.any():
             last_year_mask = (last_year_data[date_col].dt.month == target_month)
         
-        # 计算去年同期的平均值
         if last_year_mask.any():
-            last_year_value = last_year_data[last_year_mask]['Actual Pax'].mean()
+            last_year_avg = last_year_data[last_year_mask]['Actual Pax'].mean()
         else:
-            # 实在找不到，用整体均值
-            last_year_value = self.historical_pax_mean
-
-        # ========== 规则1：如果去年同期接近0，今年也强制为0 ==========
-        if last_year_value <= 10:  # 阈值设为10
-            adjusted_pred = 0.0
-            logging.debug(
-                f"{self.name} {pred_date.date()} [零值规则]: "
-                f"去年同月均值={last_year_value:.1f}, 强制预测=0"
-            )
-            adjusted_predictions.append(adjusted_pred)
-            continue
-
-        # ========== 规则2：淡季（1-3月，10-12月）预测上限=去年同期2倍 ==========
-        is_low_season = target_month in [1, 2, 3, 10, 11, 12]
+            last_year_avg = self.historical_pax_mean
         
-        if is_low_season:
-            max_allowed = last_year_value * 2.0
-            if raw_pred > max_allowed:
-                adjusted_pred = max_allowed
-                logging.debug(
-                    f"{self.name} {pred_date.date()} [淡季封顶]: "
-                    f"原始={raw_pred:.1f}, 去年同月均值={last_year_value:.1f}, "
-                    f"封顶={adjusted_pred:.1f}"
-                )
-                adjusted_predictions.append(adjusted_pred)
-            else:
-                adjusted_predictions.append(raw_pred)
-        
-        # ========== 规则3：旺季也不能太离谱，上限=历史最大值1.5倍 ==========
+        # 如果去年同期接近0，强制为0
+        if last_year_avg <= 10:
+            capped_value = 0.0
+        # 淡季：上限=去年同期2倍
+        elif target_month in [1, 2, 3, 10, 11, 12]:
+            capped_value = min(pred_value, last_year_avg * 2.0)
+        # 旺季：上限=历史最大值1.5倍
         else:
-            max_allowed = self.max_historical_pax * 1.5
-            if raw_pred > max_allowed:
-                adjusted_pred = max_allowed
-                logging.debug(
-                    f"{self.name} {pred_date.date()} [旺季封顶]: "
-                    f"原始={raw_pred:.1f}, 封顶={adjusted_pred:.1f}"
-                )
-                adjusted_predictions.append(adjusted_pred)
-            else:
-                adjusted_predictions.append(raw_pred)
-
-    return pd.Series(adjusted_predictions)
+            capped_value = min(pred_value, self.max_historical_pax * 1.5)
+        
+        hard_capped_predictions.append(capped_value)
+    
+    # 用强制上限后的结果替换
+    final_predictions = pd.Series(hard_capped_predictions).clip(lower=0)
+    
+    return pd.DataFrame({'Dates': dates, 'Predictions': final_predictions})
