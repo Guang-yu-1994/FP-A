@@ -1,55 +1,5 @@
-"""
-Prophet模型淡季极端预测修复方案
-主要修复三个关键点：
-1. 更保守的参数搜索空间
-2. 增强的季节性零值检测
-3. 更严格的淡季上限约束
-"""
-
-# ========== 修复1: 更保守的参数搜索空间 ==========
-def _get_param_search_space(self):
-    """根据数据特征定义智能搜索空间（修复版）"""
-    
-    if self.ytd_growth_rate < -0.3 or self.recent_trend_ratio < 0.7:
-        # 大幅下降：极保守参数
-        changepoint_range = [0.001, 0.005, 0.01]
-        seasonality_range = [10.0, 15.0, 20.0]
-        logging.info(f"{self.name} 大幅下降场景，使用极保守参数空间")
-        
-    elif self.ytd_growth_rate < -0.15 or self.recent_trend_ratio < 0.85:
-        # 中度下降：保守参数
-        changepoint_range = [0.005, 0.01, 0.03]  # 降低最大值从0.05到0.03
-        seasonality_range = [5.0, 8.0, 10.0]
-        logging.info(f"{self.name} 中度下降场景，使用保守参数空间")
-        
-    elif self.ytd_growth_rate > 0.3 or self.recent_trend_ratio > 1.3:
-        # 大幅增长：适度激进（但比原来更保守）
-        changepoint_range = [0.03, 0.05, 0.08]  # 原来是[0.05, 0.1, 0.2]
-        seasonality_range = [3.0, 5.0, 8.0]
-        logging.info(f"{self.name} 大幅增长场景，使用适度激进参数空间")
-        
-    else:
-        # 正常场景：标准参数（更保守）
-        changepoint_range = [0.01, 0.03, 0.05]  # 原来最大是0.1
-        seasonality_range = [3.0, 5.0, 10.0]
-        logging.info(f"{self.name} 正常场景，使用标准参数空间")
-
-    # 季节性模式选择
-    if self.seasonal_volatility > 3.0:
-        seasonality_modes = ['multiplicative', 'additive']
-    else:
-        seasonality_modes = ['additive', 'multiplicative']
-
-    return {
-        'changepoint_prior_scale': changepoint_range,
-        'seasonality_prior_scale': seasonality_range,
-        'seasonality_mode': seasonality_modes
-    }
-
-
-# ========== 修复2: 增强的季节性零值检测 ==========
 def _apply_intelligent_floor(self, predictions, dates):
-    """智能下界保护（增强版：更强的淡季零值检测）"""
+    """智能下界保护（简化版：只做一件事 - 限制淡季预测上限）"""
     last_year_data = self.data.copy()
     date_col = next(
         col for col in ['Correct Event Time', 'Date', 'WeekStart', 'MonthStart'] 
@@ -62,214 +12,68 @@ def _apply_intelligent_floor(self, predictions, dates):
     for i, pred_date in enumerate(dates):
         raw_pred = predictions.iloc[i]
 
-        # ===== 增强：扩大时间窗口查找去年同期数据 =====
-        if self.time_level == 'weekly':
-            last_year_date = pred_date - pd.DateOffset(years=1)
-            # 扩大窗口到±14天（原来是±7天）
-            mask = (last_year_data[date_col] >= last_year_date - pd.Timedelta(days=14)) & \
-                   (last_year_data[date_col] <= last_year_date + pd.Timedelta(days=14))
-        else:
-            last_year_date = pred_date - pd.DateOffset(years=1)
-            mask = (last_year_data[date_col].dt.month == last_year_date.month) & \
-                   (last_year_data[date_col].dt.year == last_year_date.year)
-
-        has_last_year_data = mask.any()
+        # ========== 简单粗暴：用月份匹配去年同期 ==========
+        # 找去年同月份的所有数据（不管day/week）
+        target_month = pred_date.month
+        target_year = pred_date.year
         
-        # ===== 增强：如果没找到去年数据，尝试前年数据 =====
-        if not has_last_year_data and self.time_level == 'weekly':
-            two_years_ago = pred_date - pd.DateOffset(years=2)
-            mask_2y = (last_year_data[date_col] >= two_years_ago - pd.Timedelta(days=14)) & \
-                      (last_year_data[date_col] <= two_years_ago + pd.Timedelta(days=14))
-            if mask_2y.any():
-                has_last_year_data = True
-                mask = mask_2y
-                logging.debug(f"{self.name} {pred_date.date()} 使用前年数据作为参考")
+        # 查找去年同月
+        last_year_mask = (last_year_data[date_col].dt.month == target_month) & \
+                         (last_year_data[date_col].dt.year == target_year - 1)
+        
+        # 如果没找到去年的，找前年的
+        if not last_year_mask.any():
+            last_year_mask = (last_year_data[date_col].dt.month == target_month) & \
+                             (last_year_data[date_col].dt.year == target_year - 2)
+        
+        # 如果还是没找到，用历史同月的平均值
+        if not last_year_mask.any():
+            last_year_mask = (last_year_data[date_col].dt.month == target_month)
+        
+        # 计算去年同期的平均值
+        if last_year_mask.any():
+            last_year_value = last_year_data[last_year_mask]['Actual Pax'].mean()
+        else:
+            # 实在找不到，用整体均值
+            last_year_value = self.historical_pax_mean
 
-        last_year_value = last_year_data[mask]['Actual Pax'].mean() if has_last_year_data else -1
-
-        # ===== 规则0: 季节性关闭强制规则（提高优先级）=====
-        # 阈值从<=1提高到<=5，更宽松地识别"接近零"的情况
-        if has_last_year_data and last_year_value <= 5:
+        # ========== 规则1：如果去年同期接近0，今年也强制为0 ==========
+        if last_year_value <= 10:  # 阈值设为10
             adjusted_pred = 0.0
             logging.debug(
-                f"{self.name} {pred_date.date()} [季节性关闭规则]: "
-                f"去年同期值为 {last_year_value:.1f}，强制预测为0。"
+                f"{self.name} {pred_date.date()} [零值规则]: "
+                f"去年同月均值={last_year_value:.1f}, 强制预测=0"
             )
             adjusted_predictions.append(adjusted_pred)
             continue
 
-        # 如果去年同期没有数据，使用历史平均值
-        if not has_last_year_data:
-            last_year_value = self.historical_pax_mean
-
-        # 定义淡季
-        is_low_season = pred_date.month in [1, 2, 3, 10, 11, 12]
-
-        # ===== 规则1: 预测值过低（智能下限）=====
-        if raw_pred < last_year_value * 0.2 and last_year_value > 0:
-            smoothed_growth = 0.6 * self.ytd_growth_rate + 0.4 * (self.recent_trend_ratio - 1)
-            smoothed_growth = max(smoothed_growth, -0.4)
-
-            if self.historical_seasonality is not None:
-                if self.time_level == 'weekly':
-                    week_num = pred_date.isocalendar()[1]
-                    seasonal_factor = self.historical_seasonality.get(week_num, 1.0) / (
-                        self.historical_pax_mean + 1e-9
-                    )
-                else:
-                    month_num = pred_date.month
-                    seasonal_factor = self.historical_seasonality.get(month_num, 1.0) / (
-                        self.historical_pax_mean + 1e-9
-                    )
-            else:
-                seasonal_factor = 1.0
-
-            baseline = last_year_value * (1 + smoothed_growth) * seasonal_factor
-            adjusted_pred = min(max(raw_pred, baseline), last_year_value * 1.2)
-            logging.debug(
-                f"{self.name} {pred_date.date()} [智能下限规则]: "
-                f"原始={raw_pred:.1f}, 调整后={adjusted_pred:.1f}"
-            )
-            adjusted_predictions.append(adjusted_pred)
-
-        # ===== 规则2: 淡季预测过高（更严格）=====
-        elif is_low_season and last_year_value > 0:
-            # 降低上限倍数：从2.0降到1.3
-            if raw_pred > last_year_value * 1.3:
-                capped_pred = last_year_value * 1.3  # 原来是1.5
+        # ========== 规则2：淡季（1-3月，10-12月）预测上限=去年同期2倍 ==========
+        is_low_season = target_month in [1, 2, 3, 10, 11, 12]
+        
+        if is_low_season:
+            max_allowed = last_year_value * 2.0
+            if raw_pred > max_allowed:
+                adjusted_pred = max_allowed
                 logging.debug(
-                    f"{self.name} {pred_date.date()} [淡季封顶规则]: "
-                    f"原始={raw_pred:.1f}, 去年同期={last_year_value:.1f}, "
-                    f"调整后={capped_pred:.1f}"
+                    f"{self.name} {pred_date.date()} [淡季封顶]: "
+                    f"原始={raw_pred:.1f}, 去年同月均值={last_year_value:.1f}, "
+                    f"封顶={adjusted_pred:.1f}"
                 )
-                adjusted_predictions.append(capped_pred)
+                adjusted_predictions.append(adjusted_pred)
+            else:
+                adjusted_predictions.append(raw_pred)
+        
+        # ========== 规则3：旺季也不能太离谱，上限=历史最大值1.5倍 ==========
+        else:
+            max_allowed = self.max_historical_pax * 1.5
+            if raw_pred > max_allowed:
+                adjusted_pred = max_allowed
+                logging.debug(
+                    f"{self.name} {pred_date.date()} [旺季封顶]: "
+                    f"原始={raw_pred:.1f}, 封顶={adjusted_pred:.1f}"
+                )
+                adjusted_predictions.append(adjusted_pred)
             else:
                 adjusted_predictions.append(raw_pred)
 
-        # ===== 规则3: 预测超过历史最高纪录 =====
-        elif raw_pred > self.max_historical_pax * 1.5:
-            capped_pred = self.max_historical_pax * 1.5
-            logging.debug(
-                f"{self.name} {pred_date.date()} [超历史最大值规则]: "
-                f"原始={raw_pred:.1f}, 调整后={capped_pred:.1f}"
-            )
-            adjusted_predictions.append(capped_pred)
-
-        else:
-            adjusted_predictions.append(raw_pred)
-
     return pd.Series(adjusted_predictions)
-
-
-# ========== 修复3: 增强CV评分的淡季异常惩罚 ==========
-def _time_series_cv_score(self, df_prophet, params, n_splits=3):
-    """时间序列交叉验证评分（增强版：更严格的淡季预测惩罚）"""
-    df_sorted = df_prophet.sort_values('ds').reset_index(drop=True)
-    n = len(df_sorted)
-
-    if n < 20:
-        n_splits = 1
-
-    scores = []
-    min_train_size = max(int(n * 0.6), 10)
-
-    for i in range(n_splits):
-        if n_splits == 1:
-            train_size = max(int(n * 0.8), n - 5)
-        else:
-            train_size = min_train_size + int((n - min_train_size) * (i + 1) / (n_splits + 1))
-
-        train = df_sorted.iloc[:train_size]
-        test = df_sorted.iloc[train_size:train_size + min(5, n - train_size)]
-
-        if len(test) == 0:
-            continue
-
-        try:
-            model = Prophet(
-                yearly_seasonality=True,
-                weekly_seasonality=True,
-                daily_seasonality=False,
-                changepoint_prior_scale=params['changepoint_prior_scale'],
-                seasonality_prior_scale=params['seasonality_prior_scale'],
-                seasonality_mode=params['seasonality_mode'],
-                growth='linear'
-            )
-
-            for col in self.feature_engineer.get_feature_cols():
-                model.add_regressor(col)
-
-            model.fit(train[['ds', 'y'] + self.feature_engineer.get_feature_cols()])
-
-            future = test[['ds'] + self.feature_engineer.get_feature_cols()]
-            forecast = model.predict(future)
-            y_pred = forecast['yhat'].clip(lower=0)
-
-            # 基础误差指标
-            mae = mean_absolute_error(test['y'], y_pred)
-            mape = np.mean(np.abs((test['y'] - y_pred) / (test['y'] + 1e-10))) * 100
-
-            # === 惩罚机制（增强版）===
-            penalty = 0
-
-            # 惩罚1：预测值全为0
-            if y_pred.sum() == 0:
-                penalty += 10000
-
-            # 惩罚2：预测均值过度偏离真实均值
-            mean_pred = y_pred.mean()
-            mean_true = test['y'].mean()
-            if mean_true > 0:
-                pred_ratio = mean_pred / mean_true
-                if pred_ratio > 3.0 or pred_ratio < 0.2:
-                    penalty += 500 * abs(np.log(pred_ratio))
-
-            # 惩罚3：淡季极端高预测（增强版）
-            for j in range(len(test)):
-                test_val = test.iloc[j]['y']
-                pred_val = y_pred.iloc[j]
-
-                # 如果历史值很小但预测很大（提高惩罚力度）
-                if test_val < self.historical_pax_mean * 0.2 and pred_val > test_val * 3:  # 从5倍降到3倍
-                    # 惩罚系数从200提高到500
-                    penalty += 500 * (pred_val / (test_val + 1))
-
-                # 如果预测值超过历史最大值的1.5倍（降低阈值）
-                if pred_val > self.max_historical_pax * 1.5:  # 从2.0降到1.5
-                    penalty += 500  # 从300提高到500
-
-            # 综合得分
-            score = 0.7 * mae + 0.3 * mape + penalty
-            scores.append(score)
-
-        except Exception as e:
-            logging.warning(f"CV评分失败: {str(e)}")
-            scores.append(1e6)
-
-    return np.mean(scores) if scores else 1e6
-
-
-# ========== 使用说明 ==========
-"""
-将上述三个方法替换到你的 ProphetModel 类中，主要改动：
-
-1. _get_param_search_space: 
-   - 所有场景的changepoint_prior_scale最大值都降低了
-   - 避免模型对微小趋势过度敏感
-
-2. _apply_intelligent_floor:
-   - 扩大时间窗口到±14天（原来±7天）
-   - 如果没有去年数据，尝试查找前年数据
-   - 季节性关闭阈值从<=1提高到<=5
-   - 淡季封顶倍数从2.0降到1.3
-
-3. _time_series_cv_score:
-   - 淡季异常惩罚阈值从5倍降到3倍
-   - 惩罚系数从200/300提高到500
-   - 让参数搜索过程更倾向于避免淡季极端预测
-
-测试建议：
-- 先用1-2个有问题的Tour测试
-- 观察日志输出（logging.debug）看规则是否正确触发
-- 如果仍有问题，可以进一步降低changepoint_prior_scale上限到0.03
-"""
