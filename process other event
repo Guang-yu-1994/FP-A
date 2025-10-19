@@ -15,15 +15,20 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 class PredictionProcessor:
     def __init__(self, start_date='2024-01-01', end_date='2024-12-31', base_dir=BASE_DIR, forecast_start_date=None,
-                 sigmoid_k=1, sigmoid_max_rate=0.1886):  # 新增 sigmoid_k 和 sigmoid_max_rate 参数
+                 sigmoid_k=1, sigmoid_max_rate=0.1886, time_level='weekly'):
         self.start_date = pd.to_datetime(start_date)
         self.end_date = pd.to_datetime(end_date)
         if self.start_date > self.end_date:
             raise ValueError("start_date 不能晚于 end_date")
 
         self.base_dir = base_dir
-        # Added Public_DIR as a class attribute
-        self.Public_DIR = r"C:\City Experience\Public Data Base"  # Using raw string to handle backslashes
+        self.Public_DIR = r"C:\City Experience\Public Data Base"
+        
+        # 新增：时间级别参数
+        valid_time_levels = ['hourly', 'daily', 'weekly', 'monthly']
+        if time_level.lower() not in valid_time_levels:
+            raise ValueError(f"time_level must be one of {valid_time_levels}")
+        self.time_level = time_level.lower()
 
         if forecast_start_date is None:
             self.forecast_start_date = pd.to_datetime(datetime.now() - relativedelta(months=2)).replace(hour=0,
@@ -36,18 +41,15 @@ class PredictionProcessor:
         self.failed_tours = set()
         self.tour_id_map = None
         self.predict_tour_ids = set()
+        self.bookings_data = None
 
         logging.info("正在初始化并运行 ActualsAggregator 以生成实际值 CSV 文件")
-        # 将 sigmoid_k 和 sigmoid_max_rate 传递给 ActualsAggregator
         aggregator = ActualsAggregator(base_dir=self.base_dir, start_date=self.start_date, end_date=self.end_date,
                                        sigmoid_k=sigmoid_k, sigmoid_max_rate=sigmoid_max_rate)
         aggregator.process_all_levels()
         logging.info("ActualsAggregator 处理完成，已生成所有时间级别的 actuals CSV 文件")
 
-        # Basic logging configuration for the class. This should ideally be set up once globally.
-        # However, to ensure it runs with the instance, it's kept here.
-        # Avoids re-configuring if already done by a higher-level script.
-        if not logging.getLogger().handlers:  # Check if handlers are already configured
+        if not logging.getLogger().handlers:
             logging.basicConfig(
                 level=logging.INFO,
                 format='%(asctime)s - %(levelname)s - %(message)s',
@@ -57,21 +59,19 @@ class PredictionProcessor:
                 ]
             )
         logging.info(
-            f"初始化 PredictionProcessor，时间范围: {self.start_date} 到 {self.end_date}, 预测开始日期: {self.forecast_start_date}")
+            f"初始化 PredictionProcessor，时间范围: {self.start_date} 到 {self.end_date}, 预测开始日期: {self.forecast_start_date}, 时间级别: {self.time_level}")
 
     def load_tour_id_map(self):
         """
         Loads the mapping from Tour ID to Event Name.
         Standardizes Tour IDs (lowercase and remove spaces) to match Tour IDs in processed dataframes.
         """
-        # Changed file path to use self.Public_DIR
         tour_id_file = os.path.join(self.Public_DIR, "Tour ID.xlsx")
 
         if os.path.exists(tour_id_file):
             try:
                 tour_df = pd.read_excel(tour_id_file, sheet_name="Tour ID")
                 if 'Tour ID' in tour_df.columns and 'Event Name' in tour_df.columns:
-                    # Key modification: Standardize Tour ID (lowercase and remove spaces)
                     standardized_tour_ids = tour_df['Tour ID'].astype(str).str.lower().str.strip()
                     self.tour_id_map = dict(zip(standardized_tour_ids, tour_df['Event Name'].astype(str)))
                     logging.info(f"Successfully loaded Tour ID to Event Name map from {tour_id_file}")
@@ -97,6 +97,71 @@ class PredictionProcessor:
         else:
             logging.warning(f"未找到 {predict_tour_file}")
 
+    def load_bookings_data(self):
+        """
+        加载并处理bookings data
+        """
+        bookings_file = os.path.join(self.Public_DIR, "B2B info.xlsx")
+        if not os.path.exists(bookings_file):
+            logging.error(f"未找到 {bookings_file}")
+            return None
+        
+        try:
+            bookings_df = pd.read_excel(bookings_file, sheet_name="Bookings Ventrada")
+            
+            # 检查必要列
+            if 'Travel Date' not in bookings_df.columns or 'PAX' not in bookings_df.columns or 'Tour ID' not in bookings_df.columns:
+                logging.error("Bookings Ventrada sheet 缺少必要列")
+                return None
+            
+            # 转换日期
+            bookings_df['Travel Date'] = pd.to_datetime(bookings_df['Travel Date'], errors='coerce')
+            
+            # 获取本周周一日期
+            today = pd.Timestamp.now()
+            this_monday = today - pd.Timedelta(days=today.weekday())
+            this_monday = this_monday.normalize()
+            
+            # 筛选未来期间的数据（本周周一之后）
+            future_bookings = bookings_df[bookings_df['Travel Date'] >= this_monday].copy()
+            
+            # 标准化Tour ID
+            future_bookings['Tour ID'] = future_bookings['Tour ID'].astype(str).str.lower().str.strip()
+            
+            # 根据时间级别聚合
+            if self.time_level == 'weekly':
+                # 生成StartOfWeek（周一日期）
+                future_bookings['StartOfWeek'] = future_bookings['Travel Date'] - pd.to_timedelta(
+                    future_bookings['Travel Date'].dt.dayofweek, unit='d')
+                aggregated = future_bookings.groupby(['StartOfWeek', 'Tour ID'])['PAX'].sum().reset_index()
+                aggregated.rename(columns={'StartOfWeek': 'Date'}, inplace=True)
+            elif self.time_level == 'daily':
+                aggregated = future_bookings.groupby(['Travel Date', 'Tour ID'])['PAX'].sum().reset_index()
+                aggregated.rename(columns={'Travel Date': 'Date'}, inplace=True)
+            elif self.time_level == 'monthly':
+                future_bookings['Month'] = future_bookings['Travel Date'].dt.to_period('M').dt.to_timestamp()
+                aggregated = future_bookings.groupby(['Month', 'Tour ID'])['PAX'].sum().reset_index()
+                aggregated.rename(columns={'Month': 'Date'}, inplace=True)
+            else:  # hourly
+                # 对于hourly，假设按日聚合（因为Travel Date通常没有小时信息）
+                aggregated = future_bookings.groupby(['Travel Date', 'Tour ID'])['PAX'].sum().reset_index()
+                aggregated.rename(columns={'Travel Date': 'Date'}, inplace=True)
+            
+            self.bookings_data = aggregated
+            
+            # 输出bookings data
+            output_dir = os.path.join(self.base_dir, "Outputs", self.time_level)
+            os.makedirs(output_dir, exist_ok=True)
+            bookings_output_path = os.path.join(output_dir, f"bookings_data_{self.time_level}.csv")
+            aggregated.to_csv(bookings_output_path, index=False)
+            logging.info(f"Bookings data saved to {bookings_output_path}")
+            
+            return aggregated
+            
+        except Exception as e:
+            logging.error(f"加载bookings data失败: {str(e)}")
+            return None
+
     def get_agg_folder_map(self):
         outputs_dir = os.path.join(self.base_dir, "Outputs")
         if not os.path.exists(outputs_dir):
@@ -112,18 +177,30 @@ class PredictionProcessor:
         return agg_folder_map
 
     def check_required_files(self):
+        """
+        只检查指定时间级别的文件
+        """
         agg_folder_map = self.get_agg_folder_map()
-        valid_agg_levels = []
-        for agg_level, folder in agg_folder_map.items():
-            required_files = [
-                os.path.join(self.base_dir, "Spreadsheets Source", "Tour ID Failed to Predict.xlsx"),
-                os.path.join(self.base_dir, "Spreadsheets Source", "Tour ID to Predict.xlsx"),
-                os.path.join(self.base_dir, "Outputs", folder, f"predictions_{agg_level}.xlsx"),
-                os.path.join(self.base_dir, "Outputs", folder, f"actuals_{agg_level}_horizontal.csv")
-            ]
-            if all(os.path.exists(file) for file in required_files):
-                valid_agg_levels.append(agg_level)
-        return valid_agg_levels
+        
+        # 只检查指定的时间级别
+        if self.time_level not in agg_folder_map:
+            logging.error(f"未找到时间级别 '{self.time_level}' 对应的文件夹")
+            return []
+        
+        folder = agg_folder_map[self.time_level]
+        required_files = [
+            os.path.join(self.base_dir, "Spreadsheets Source", "Tour ID Failed to Predict.xlsx"),
+            os.path.join(self.base_dir, "Spreadsheets Source", "Tour ID to Predict.xlsx"),
+            os.path.join(self.base_dir, "Outputs", folder, f"predictions_{self.time_level}.xlsx"),
+            os.path.join(self.base_dir, "Outputs", folder, f"actuals_{self.time_level}_horizontal.csv")
+        ]
+        
+        if all(os.path.exists(file) for file in required_files):
+            return [self.time_level]
+        else:
+            missing = [f for f in required_files if not os.path.exists(f)]
+            logging.error(f"缺少必要文件: {missing}")
+            return []
 
     def load_failed_tours(self):
         failed_tours_file = os.path.join(self.base_dir, "Spreadsheets Source", "Tour ID Failed to Predict.xlsx")
@@ -183,23 +260,18 @@ class PredictionProcessor:
         if self.tour_id_map is None:
             self.load_tour_id_map()
 
-        # Copy DataFrame to avoid fragmentation
         summary_df = joined_df.copy()
-        # Add temporary debugging code: Find rows where Event Name is still the Tour ID itself
-        # This means these Tour IDs did not find a match in tour_id_map
         summary_df['Event Name'] = summary_df['Tour ID'].map(self.tour_id_map).fillna(summary_df['Tour ID'])
         unmapped_tours = summary_df[summary_df['Event Name'] == summary_df['Tour ID']]
         if not unmapped_tours.empty:
             logging.warning(
                 f"The following Tour IDs could not be mapped to an Event Name and were filled with their own Tour ID:\n{unmapped_tours[['Tour ID', 'Event Name']].to_string()}")
 
-        # Convert _Pred and _Actual columns to integers
         date_cols_pred = [col for col in summary_df.columns if col.endswith('_Pred')]
         date_cols_actual = [col for col in summary_df.columns if col.endswith('_Actual')]
         for col in date_cols_pred + date_cols_actual:
             summary_df[col] = summary_df[col].fillna(0).astype(int)
 
-        # Use pd.concat to merge Is_Predict_Tour column
         is_predict_tour = pd.Series(
             summary_df['Tour ID'].isin(self.predict_tour_ids).astype(int),
             index=summary_df.index,
@@ -207,7 +279,6 @@ class PredictionProcessor:
         )
         summary_df = pd.concat([summary_df, is_predict_tour], axis=1)
 
-        # Sort by Is_Predict_Tour and Period Sum in descending order
         summary_df = summary_df.sort_values(by=['Is_Predict_Tour', 'Period Sum'], ascending=[False, False])
         summary_df = summary_df.drop(columns=['Is_Predict_Tour'])
 
@@ -220,15 +291,12 @@ class PredictionProcessor:
         forecast_cols = ['Tour ID', 'Event Name'] + date_cols_pred
         forecast_df = source_df[forecast_cols].copy()
 
-        # Remove _Pred suffix, rename columns to dates
         forecast_df.columns = ['Tour ID', 'Event Name'] + [col.replace('_Pred', '') for col in date_cols_pred]
 
-        # Filter date columns starting from forecast_start_date
         date_columns = [col for col in forecast_df.columns if col not in ['Tour ID', 'Event Name']]
         valid_dates = [col for col in date_columns if pd.to_datetime(col) >= self.forecast_start_date]
         forecast_df = forecast_df[['Tour ID', 'Event Name'] + valid_dates]
 
-        # Save forecast CSV
         forecast_output_path = os.path.join(output_dir, output_filename)
         forecast_df.to_csv(forecast_output_path, index=False)
         logging.info(f"Forecast saved to {forecast_output_path}")
@@ -251,7 +319,6 @@ class PredictionProcessor:
         date_cols_pred = [col for col in summary_df.columns if col.endswith('_Pred')]
         date_cols_actual = [col for col in summary_df.columns if col.endswith('_Actual')]
 
-        # Stack Pred and Actual of summary
         pred_melt = pd.melt(
             summary_df,
             id_vars=['Tour ID', 'Event Name'],
@@ -270,7 +337,6 @@ class PredictionProcessor:
         )
         actual_melt['Date'] = actual_melt['Date'].str.replace('_Actual', '')
 
-        # Stack Pred of adjusted summary
         adj_pred_melt = pd.melt(
             adjusted_df,
             id_vars=['Tour ID', 'Event Name'],
@@ -280,46 +346,145 @@ class PredictionProcessor:
         )
         adj_pred_melt['Date'] = adj_pred_melt['Date'].str.replace('_Pred', '')
 
-        # Merge the three melted DataFrames
         stacked_df = pred_melt.merge(actual_melt, on=['Tour ID', 'Event Name', 'Date'], how='outer')
         stacked_df = stacked_df.merge(adj_pred_melt, on=['Tour ID', 'Event Name', 'Date'], how='outer')
         stacked_df['Date'] = pd.to_datetime(stacked_df['Date'])
 
-        # Save stacked summary
         stacked_output_path = os.path.join(output_dir, f"summary_stacked_{agg_level}.csv")
         stacked_df.to_csv(stacked_output_path, index=False)
         logging.info(f"Stacked Summary saved to {stacked_output_path}")
         return stacked_df
 
+    def calculate_low_season_sd(self, stacked_df):
+        """
+        计算淡季(Q1和Q4)的标准差
+        """
+        df = stacked_df.copy()
+        df['Date'] = pd.to_datetime(df['Date'])
+        df['Quarter'] = df['Date'].dt.quarter
+        
+        # 筛选淡季数据（Q1和Q4）
+        low_season_df = df[df['Quarter'].isin([1, 4])].copy()
+        
+        # 计算每个Tour ID的标准差
+        sd_df = low_season_df.groupby('Tour ID')['Actual'].std().reset_index()
+        sd_df.columns = ['Tour ID', 'Low_Season_SD']
+        sd_df['Low_Season_SD'] = sd_df['Low_Season_SD'].fillna(0)
+        
+        return sd_df
+
+    def get_same_period_last_year(self, date, time_level):
+        """
+        获取去年同期日期
+        """
+        if time_level == 'weekly':
+            # 对于周级别，找到去年同一周的周一
+            last_year_date = date - pd.DateOffset(years=1)
+            # 调整到周一
+            days_to_monday = last_year_date.weekday()
+            last_year_monday = last_year_date - pd.Timedelta(days=days_to_monday)
+            return last_year_monday
+        else:
+            # 对于日级别或其他，直接减一年
+            return date - pd.DateOffset(years=1)
+
+    def adjust_stacked_summary(self, stacked_df, output_dir):
+        """
+        对stacked summary进行调整
+        """
+        df = stacked_df.copy()
+        df['Date'] = pd.to_datetime(df['Date'])
+        df['Quarter'] = df['Date'].dt.quarter
+        
+        # 1. 计算淡季标准差
+        sd_df = self.calculate_low_season_sd(df)
+        sd_output_path = os.path.join(output_dir, f"low_season_sd_{self.time_level}.csv")
+        sd_df.to_csv(sd_output_path, index=False)
+        logging.info(f"淡季标准差已保存到 {sd_output_path}")
+        
+        # 合并标准差到主数据
+        df = df.merge(sd_df, on='Tour ID', how='left')
+        df['Low_Season_SD'] = df['Low_Season_SD'].fillna(0)
+        
+        # 2. 合并bookings data
+        if self.bookings_data is not None:
+            bookings_merge = self.bookings_data.copy()
+            bookings_merge['Date'] = pd.to_datetime(bookings_merge['Date'])
+            df = df.merge(bookings_merge, on=['Tour ID', 'Date'], how='left', suffixes=('', '_Booked'))
+            df['PAX'] = df['PAX'].fillna(0)
+        else:
+            df['PAX'] = 0
+        
+        # 3. 应用预订数据调整：如果Growth_Adj_Pred < 已预订的PAX，上调为已预订 + (0.382 * SD)
+        mask_below_booking = df['Growth_Adj_Pred'] < df['PAX']
+        df.loc[mask_below_booking, 'Growth_Adj_Pred'] = df.loc[mask_below_booking, 'PAX'] + (
+            0.382 * df.loc[mask_below_booking, 'Low_Season_SD'])
+        
+        # 4. 对淡季数据设置上下限
+        low_season_mask = df['Quarter'].isin([1, 4])
+        
+        for idx in df[low_season_mask].index:
+            current_date = df.loc[idx, 'Date']
+            tour_id = df.loc[idx, 'Tour ID']
+            
+            # 获取去年同期日期
+            last_year_date = self.get_same_period_last_year(current_date, self.time_level)
+            
+            # 查找去年同期数据
+            last_year_data = df[(df['Tour ID'] == tour_id) & (df['Date'] == last_year_date)]
+            
+            if not last_year_data.empty:
+                last_year_actual = last_year_data['Actual'].values[0]
+                
+                # 计算去年同期淡季的标准差（使用已计算的Low_Season_SD）
+                sd = df.loc[idx, 'Low_Season_SD']
+                
+                # 计算上下限
+                lower_bound = last_year_actual * (1 - 0.0618 * sd)
+                upper_bound = last_year_actual * (1 + 0.0618 * sd)
+                
+                # 应用上下限
+                current_pred = df.loc[idx, 'Growth_Adj_Pred']
+                df.loc[idx, 'Growth_Adj_Pred'] = np.clip(current_pred, lower_bound, upper_bound)
+        
+        # 四舍五入
+        df['Growth_Adj_Pred'] = df['Growth_Adj_Pred'].round().astype(int)
+        
+        # 删除辅助列
+        df = df.drop(columns=['Quarter', 'Low_Season_SD', 'PAX'], errors='ignore')
+        
+        # 5. 输出到原文件夹
+        output_path = os.path.join(output_dir, f"summary_stacked_{self.time_level}.csv")
+        df.to_csv(output_path, index=False)
+        logging.info(f"调整后的Stacked Summary已保存到 {output_path}")
+        
+        # 6. 同时输出到Public Data Base文件夹
+        public_output_path = os.path.join(self.Public_DIR, f"summary_stacked_{self.time_level}.csv")
+        df.to_csv(public_output_path, index=False)
+        logging.info(f"调整后的Stacked Summary已保存到 {public_output_path}")
+        
+        return df
+
     def plot_predictions(self, stacked_df, agg_level, output_dir):
         os.makedirs(output_dir, exist_ok=True)
 
-        # --- 新增的稳健性代码 ---
-        # 强制将 stacked_df 中的 'Tour ID' 列转换为字符串，并去除 .0 后缀
-        # 以处理 12345.0 这样的情况
         if 'Tour ID' in stacked_df.columns:
             stacked_df['Tour ID'] = stacked_df['Tour ID'].astype(str).str.replace(r'\.0$', '', regex=True)
-        # --- 稳健性代码结束 ---
 
         for tour_id in self.predict_tour_ids:
-            # --- 新增的调试代码 ---
             print("-" * 50)
             print(f"DEBUG: 正在尝试为 Tour ID '{tour_id}' (类型: {type(tour_id)}) 绘图")
             print(f"DEBUG: stacked_df['Tour ID'] 的数据类型是: {stacked_df['Tour ID'].dtype}")
-            # --- 调试代码结束 ---
 
             tour_data = stacked_df[stacked_df['Tour ID'] == tour_id]
 
             if tour_data.empty:
                 logging.warning(f"在 stacked_df 中找不到 Tour ID '{tour_id}' 的数据，跳过绘图。")
-                # --- 新增的调试代码 ---
-                # 如果找不到，检查是否存在看起来相似的ID
                 similar_ids = [tid for tid in stacked_df['Tour ID'].unique() if tour_id in tid or tid in tour_id]
                 if similar_ids:
                     print(f"DEBUG: 在 stacked_df 中找到了相似的 ID: {similar_ids}")
                 else:
                     print(f"DEBUG: 在 stacked_df 中未找到任何与 '{tour_id}' 相似的 ID。")
-                # --- 调试代码结束 ---
                 continue
 
             dates = tour_data['Date']
@@ -345,19 +510,12 @@ class PredictionProcessor:
             plt.gca().xaxis.set_major_locator(mdates.AutoDateLocator())
             plt.gcf().autofmt_xdate()
 
-            # --- 修改后的文件名净化代码 ---
-            # 定义在Windows文件名中非法的字符集
             illegal_chars = r'[\<\>\:"/\\|?*]'
-
-            # 净化 tour_id 和 event_name
             safe_tour_id = re.sub(illegal_chars, '_', str(tour_id))
             safe_event_name = re.sub(illegal_chars, '_', str(event_name))
-
-            # 构建安全的文件名和完整路径
             filename = f"{safe_tour_id}_{safe_event_name}_{agg_level}_predictions.png"
             filepath = os.path.join(output_dir, filename)
 
-            # 使用 try-except 块来增加保存文件操作的稳健性
             try:
                 plt.savefig(filepath)
                 logging.info(f"成功保存图表: {filepath}")
@@ -365,7 +523,6 @@ class PredictionProcessor:
                 logging.error(f"保存图表失败 {filepath}: {e}")
 
             plt.close()
-            # --- 修改结束 ---
 
     def run(self):
         valid_agg_levels = self.check_required_files()
@@ -376,56 +533,66 @@ class PredictionProcessor:
         self.load_failed_tours()
         self.load_tour_id_map()
         self.load_predict_tour_ids()
+        self.load_bookings_data()
         agg_folder_map = self.get_agg_folder_map()
 
-        for agg_level in valid_agg_levels:
-            folder = agg_folder_map[agg_level]
-            output_dir = os.path.join(self.base_dir, "Outputs", folder)
+        # 只处理指定的时间级别
+        agg_level = self.time_level
+        folder = agg_folder_map[agg_level]
+        output_dir = os.path.join(self.base_dir, "Outputs", folder)
 
-            # Step 1: Load and pivot prediction
-            horizontal_prediction = self.load_and_pivot_prediction(agg_level, folder)
-            if horizontal_prediction is None:
-                continue
-            horizontal_prediction_path = os.path.join(output_dir, f"predictions_horizontal_{agg_level}.csv")
-            horizontal_prediction.to_csv(horizontal_prediction_path, index=False)
-            logging.info(f"Horizontal prediction data saved to {horizontal_prediction_path}")
+        # Step 1: Load and pivot prediction
+        horizontal_prediction = self.load_and_pivot_prediction(agg_level, folder)
+        if horizontal_prediction is None:
+            return {'summary': None}
+        horizontal_prediction_path = os.path.join(output_dir, f"predictions_horizontal_{agg_level}.csv")
+        horizontal_prediction.to_csv(horizontal_prediction_path, index=False)
+        logging.info(f"Horizontal prediction data saved to {horizontal_prediction_path}")
 
-            # Step 2: Filter successful tours and join with actuals
-            successful_prediction = self.filter_successful_tours(horizontal_prediction)
-            joined_df = self.join_actual_and_prediction(agg_level, folder, successful_prediction)
-            if joined_df is None:
-                continue
+        # Step 2: Filter successful tours and join with actuals
+        successful_prediction = self.filter_successful_tours(horizontal_prediction)
+        joined_df = self.join_actual_and_prediction(agg_level, folder, successful_prediction)
+        if joined_df is None:
+            return {'summary': None}
 
-            # Step 3: Generate summary
-            summary_df = self.generate_summary(joined_df, agg_level)
-            summary_output_path = os.path.join(output_dir, f"summary_{agg_level}.csv")
-            summary_df.to_csv(summary_output_path, index=False)
-            logging.info(f"Summary saved to {summary_output_path}")
+        # Step 3: Generate summary
+        summary_df = self.generate_summary(joined_df, agg_level)
+        summary_output_path = os.path.join(output_dir, f"summary_{agg_level}.csv")
+        summary_df.to_csv(summary_output_path, index=False)
+        logging.info(f"Summary saved to {summary_output_path}")
 
-            # Step 4: Generate forecast
-            self.generate_forecast(summary_df, agg_level, output_dir, f"forecast_{agg_level}.csv")
+        # Step 4: Generate forecast
+        self.generate_forecast(summary_df, agg_level, output_dir, f"forecast_{agg_level}.csv")
 
-            # Step 5: Generate growth rate adjusted summary
-            adjusted_df = self.generate_adjusted_summary(summary_df, agg_level, output_dir)
+        # Step 5: Generate growth rate adjusted summary
+        adjusted_df = self.generate_adjusted_summary(summary_df, agg_level, output_dir)
 
-            # Step 6: Generate adjusted forecast
-            self.generate_forecast(adjusted_df, agg_level, output_dir,
-                                   f"forecast_adjusted_{agg_level}.csv")
+        # Step 6: Generate adjusted forecast
+        self.generate_forecast(adjusted_df, agg_level, output_dir,
+                               f"forecast_adjusted_{agg_level}.csv")
 
-            # Step 7: Generate stacked summary
-            stacked_df = self.generate_stacked_summary(summary_df, adjusted_df, agg_level, output_dir)
+        # Step 7: Generate stacked summary
+        stacked_df = self.generate_stacked_summary(summary_df, adjusted_df, agg_level, output_dir)
 
-            # Step 8: Plot predictions
-            self.plot_predictions(stacked_df, agg_level, output_dir)
+        # Step 8: 调整stacked summary（新增）
+        adjusted_stacked_df = self.adjust_stacked_summary(stacked_df, output_dir)
 
-            self.all_summary.append(summary_df)
-            gc.collect()
+        # Step 9: Plot predictions (使用调整后的数据)
+        self.plot_predictions(adjusted_stacked_df, agg_level, output_dir)
+
+        self.all_summary.append(summary_df)
+        gc.collect()
 
         return {'summary': self.all_summary}
 
 
 if __name__ == "__main__":
-    # You can pass sigmoid_k and sigmoid_max_rate here
-    processor = PredictionProcessor(start_date='2024-01-01', end_date='2025-09-22', sigmoid_k=1,
-                                    sigmoid_max_rate=0.272)
+    # 示例：处理weekly级别的数据
+    processor = PredictionProcessor(
+        start_date='2024-01-01', 
+        end_date='2025-09-22', 
+        sigmoid_k=1,
+        sigmoid_max_rate=0.272,
+        time_level='weekly'  # 可以改为 'daily', 'monthly', 'hourly'
+    )
     processor.run()
