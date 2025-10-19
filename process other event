@@ -355,21 +355,40 @@ class PredictionProcessor:
         logging.info(f"Stacked Summary saved to {stacked_output_path}")
         return stacked_df
 
-    def calculate_low_season_sd(self, stacked_df):
+    def calculate_low_season_sd(self, stacked_df, output_dir):
         """
-        计算淡季(Q1和Q4)的标准差
+        计算淡季(Q1和Q4)的标准差，并输出统计表
         """
         df = stacked_df.copy()
         df['Date'] = pd.to_datetime(df['Date'])
         df['Quarter'] = df['Date'].dt.quarter
+        df['Year'] = df['Date'].dt.year
         
         # 筛选淡季数据（Q1和Q4）
         low_season_df = df[df['Quarter'].isin([1, 4])].copy()
         
-        # 计算每个Tour ID的标准差
-        sd_df = low_season_df.groupby('Tour ID')['Actual'].std().reset_index()
-        sd_df.columns = ['Tour ID', 'Low_Season_SD']
-        sd_df['Low_Season_SD'] = sd_df['Low_Season_SD'].fillna(0)
+        # 计算每个Tour ID的标准差和其他统计信息
+        sd_stats = low_season_df.groupby('Tour ID').agg({
+            'Actual': ['std', 'mean', 'count', 'min', 'max']
+        }).reset_index()
+        
+        sd_stats.columns = ['Tour ID', 'Low_Season_SD', 'Low_Season_Mean', 
+                           'Low_Season_Count', 'Low_Season_Min', 'Low_Season_Max']
+        sd_stats['Low_Season_SD'] = sd_stats['Low_Season_SD'].fillna(0)
+        
+        # 添加Event Name
+        if self.tour_id_map:
+            sd_stats['Event Name'] = sd_stats['Tour ID'].map(self.tour_id_map).fillna(sd_stats['Tour ID'])
+            sd_stats = sd_stats[['Tour ID', 'Event Name', 'Low_Season_SD', 'Low_Season_Mean', 
+                                'Low_Season_Count', 'Low_Season_Min', 'Low_Season_Max']]
+        
+        # 输出统计表
+        sd_output_path = os.path.join(output_dir, f"tour_id_low_season_statistics_{self.time_level}.csv")
+        sd_stats.to_csv(sd_output_path, index=False)
+        logging.info(f"各Tour ID淡季统计信息已保存到 {sd_output_path}")
+        
+        # 返回简化的SD数据框
+        sd_df = sd_stats[['Tour ID', 'Low_Season_SD']].copy()
         
         return sd_df
 
@@ -390,17 +409,18 @@ class PredictionProcessor:
 
     def adjust_stacked_summary(self, stacked_df, output_dir):
         """
-        对stacked summary进行调整
+        对stacked summary进行调整，并输出详细的调整过程统计表
         """
         df = stacked_df.copy()
         df['Date'] = pd.to_datetime(df['Date'])
         df['Quarter'] = df['Date'].dt.quarter
+        df['Year'] = df['Date'].dt.year
+        
+        # 保存原始的Growth_Adj_Pred用于比较
+        df['Original_Growth_Adj_Pred'] = df['Growth_Adj_Pred'].copy()
         
         # 1. 计算淡季标准差
-        sd_df = self.calculate_low_season_sd(df)
-        sd_output_path = os.path.join(output_dir, f"low_season_sd_{self.time_level}.csv")
-        sd_df.to_csv(sd_output_path, index=False)
-        logging.info(f"淡季标准差已保存到 {sd_output_path}")
+        sd_df = self.calculate_low_season_sd(stacked_df, output_dir)
         
         # 合并标准差到主数据
         df = df.merge(sd_df, on='Tour ID', how='left')
@@ -411,47 +431,125 @@ class PredictionProcessor:
             bookings_merge = self.bookings_data.copy()
             bookings_merge['Date'] = pd.to_datetime(bookings_merge['Date'])
             df = df.merge(bookings_merge, on=['Tour ID', 'Date'], how='left', suffixes=('', '_Booked'))
-            df['PAX'] = df['PAX'].fillna(0)
+            df['Booked_PAX'] = df['PAX'].fillna(0)
         else:
-            df['PAX'] = 0
+            df['Booked_PAX'] = 0
+        
+        # 初始化调整追踪列
+        df['Adjustment_Type'] = 'None'
+        df['Last_Year_Same_Period'] = np.nan
+        df['Last_Year_Same_Period_Date'] = pd.NaT
+        df['Lower_Bound'] = np.nan
+        df['Upper_Bound'] = np.nan
         
         # 3. 应用预订数据调整：如果Growth_Adj_Pred < 已预订的PAX，上调为已预订 + (0.382 * SD)
-        mask_below_booking = df['Growth_Adj_Pred'] < df['PAX']
-        df.loc[mask_below_booking, 'Growth_Adj_Pred'] = df.loc[mask_below_booking, 'PAX'] + (
+        mask_below_booking = df['Growth_Adj_Pred'] < df['Booked_PAX']
+        df.loc[mask_below_booking, 'Growth_Adj_Pred'] = df.loc[mask_below_booking, 'Booked_PAX'] + (
             0.382 * df.loc[mask_below_booking, 'Low_Season_SD'])
+        df.loc[mask_below_booking, 'Adjustment_Type'] = 'Booking_Adjustment'
         
         # 4. 对淡季数据设置上下限
         low_season_mask = df['Quarter'].isin([1, 4])
         
+        # 创建一个副本用于查找去年数据
+        df_lookup = df.copy()
+        
         for idx in df[low_season_mask].index:
             current_date = df.loc[idx, 'Date']
             tour_id = df.loc[idx, 'Tour ID']
+            current_year = df.loc[idx, 'Year']
+            
+            # 只对未来年份（2025及以后）的数据应用上下限
+            # 因为历史数据（2024及之前）的去年同期可能不存在
+            if current_year < 2025:
+                continue
             
             # 获取去年同期日期
             last_year_date = self.get_same_period_last_year(current_date, self.time_level)
             
             # 查找去年同期数据
-            last_year_data = df[(df['Tour ID'] == tour_id) & (df['Date'] == last_year_date)]
+            last_year_data = df_lookup[(df_lookup['Tour ID'] == tour_id) & 
+                                       (df_lookup['Date'] == last_year_date)]
             
-            if not last_year_data.empty:
+            if not last_year_data.empty and not pd.isna(last_year_data['Actual'].values[0]):
                 last_year_actual = last_year_data['Actual'].values[0]
+                
+                # 记录去年同期信息
+                df.loc[idx, 'Last_Year_Same_Period'] = last_year_actual
+                df.loc[idx, 'Last_Year_Same_Period_Date'] = last_year_date
                 
                 # 计算去年同期淡季的标准差（使用已计算的Low_Season_SD）
                 sd = df.loc[idx, 'Low_Season_SD']
+                
+                # 如果SD为0或接近0，使用一个小的默认值或跳过
+                if sd < 0.01:
+                    logging.warning(f"Tour ID {tour_id} 的SD过小({sd})，日期 {current_date}，跳过上下限调整")
+                    continue
                 
                 # 计算上下限
                 lower_bound = last_year_actual * (1 - 0.0618 * sd)
                 upper_bound = last_year_actual * (1 + 0.0618 * sd)
                 
+                df.loc[idx, 'Lower_Bound'] = lower_bound
+                df.loc[idx, 'Upper_Bound'] = upper_bound
+                
                 # 应用上下限
                 current_pred = df.loc[idx, 'Growth_Adj_Pred']
-                df.loc[idx, 'Growth_Adj_Pred'] = np.clip(current_pred, lower_bound, upper_bound)
+                adjusted_pred = np.clip(current_pred, lower_bound, upper_bound)
+                
+                if adjusted_pred != current_pred:
+                    df.loc[idx, 'Growth_Adj_Pred'] = adjusted_pred
+                    if df.loc[idx, 'Adjustment_Type'] == 'Booking_Adjustment':
+                        df.loc[idx, 'Adjustment_Type'] = 'Booking_and_Bound_Adjustment'
+                    else:
+                        df.loc[idx, 'Adjustment_Type'] = 'Bound_Adjustment'
+            else:
+                logging.debug(f"未找到 Tour ID {tour_id} 在 {last_year_date} 的去年同期数据，日期 {current_date}")
         
         # 四舍五入
         df['Growth_Adj_Pred'] = df['Growth_Adj_Pred'].round().astype(int)
         
-        # 删除辅助列
-        df = df.drop(columns=['Quarter', 'Low_Season_SD', 'PAX'], errors='ignore')
+        # 创建详细的调整统计表
+        adjustment_stats = df[[
+            'Tour ID', 'Event Name', 'Date', 'Quarter', 'Year',
+            'Original_Growth_Adj_Pred', 'Growth_Adj_Pred', 
+            'Booked_PAX', 'Low_Season_SD', 
+            'Last_Year_Same_Period', 'Last_Year_Same_Period_Date',
+            'Lower_Bound', 'Upper_Bound', 'Adjustment_Type', 'Actual'
+        ]].copy()
+        
+        # 计算调整幅度
+        adjustment_stats['Adjustment_Amount'] = (
+            adjustment_stats['Growth_Adj_Pred'] - adjustment_stats['Original_Growth_Adj_Pred']
+        )
+        
+        # 只保留有调整或者是淡季未来期间的记录
+        adjustment_stats_filtered = adjustment_stats[
+            (adjustment_stats['Adjustment_Type'] != 'None') | 
+            ((adjustment_stats['Quarter'].isin([1, 4])) & (adjustment_stats['Year'] >= 2025))
+        ].copy()
+        
+        # 输出详细调整统计表
+        adjustment_output_path = os.path.join(output_dir, f"adjustment_details_{self.time_level}.csv")
+        adjustment_stats_filtered.to_csv(adjustment_output_path, index=False)
+        logging.info(f"详细调整统计表已保存到 {adjustment_output_path}")
+        
+        # 输出调整摘要
+        adjustment_summary = adjustment_stats_filtered.groupby('Adjustment_Type').agg({
+            'Tour ID': 'count',
+            'Adjustment_Amount': ['mean', 'sum', 'min', 'max']
+        }).reset_index()
+        adjustment_summary.columns = ['Adjustment_Type', 'Count', 'Avg_Adjustment', 
+                                     'Total_Adjustment', 'Min_Adjustment', 'Max_Adjustment']
+        
+        adjustment_summary_path = os.path.join(output_dir, f"adjustment_summary_{self.time_level}.csv")
+        adjustment_summary.to_csv(adjustment_summary_path, index=False)
+        logging.info(f"调整摘要已保存到 {adjustment_summary_path}")
+        
+        # 删除辅助列，保留最终结果
+        df = df.drop(columns=['Quarter', 'Year', 'Low_Season_SD', 'Booked_PAX', 'Original_Growth_Adj_Pred',
+                             'Adjustment_Type', 'Last_Year_Same_Period', 'Last_Year_Same_Period_Date',
+                             'Lower_Bound', 'Upper_Bound'], errors='ignore')
         
         # 5. 输出到原文件夹
         output_path = os.path.join(output_dir, f"summary_stacked_{self.time_level}.csv")
