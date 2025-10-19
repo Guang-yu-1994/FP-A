@@ -1,3 +1,4 @@
+未提及改动的部分切勿擅自修正，代码改动：
 	1. 这个类需要设置一个可传入参数就是时间级别，如weekly,daily,根据传入的时间级别参数，只针对对应的时间级别进行数据处理，之前是月级别，周级别，日级别，小时级别都处理，这样不好，传入什么就处理什么级别的数据，找到对应的文件夹处理里面的数据即可！没传入的时间级别就不用处理。
 	2. 还需要载入数据bookings data一遍后续分析：读取public data base的B2B info.xlsx的Bookings Ventrada，这个数据集是用于计算未来期间的已经预定的PAX，所谓未来期间指的是日期在本周周一之后的数据，需要根据列Travel Date来筛选，筛选之后根据传入的时间级别分情况处理：如果传入weekly,则根据Travel Date一列生成StartOfWeek,用周一的日期表示那一周，然后按照StartOfWeek，Tour ID聚合列PAX，得到weekly的bookings data。同理如果是日级别就直接根据Travel Date，Tour ID聚合列PAX，得到daily的booking data。这个booking data是之后用于确定各个Tour的已预定的数据。注意这里面的PAX列就是全大写,的PAX。输出一份这个聚合好的bookings data的csv
 	3. 对之前输出的summary_stacked_时间级别.csv的数据做出如下调整
